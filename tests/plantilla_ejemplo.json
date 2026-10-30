@@ -1,0 +1,54 @@
+{
+  "id": "ejemplo",
+  "version": 1,
+  "estado": "draft",
+  "huella": {
+    "tam_pagina": [
+      595,
+      842
+    ],
+    "tol_pt": 2,
+    "fuentes": [
+      "Helvetica",
+      "Helvetica-Bold"
+    ],
+    "claves_p1": [
+      "PRESUPUESTO",
+      "Importe(",
+      "Total("
+    ],
+    "claves_doc": [
+      "UDS:",
+      "Base Imponible",
+      "TOTAL"
+    ]
+  },
+  "anclas": {
+    "linea": "^UDS:\\s*(\\d+)$",
+    "pos": "^Pos\\.\\s*(.+)$",
+    "montaje": "\\bINSTALACI[OÓ]N\\b",
+    "col_importe": "Importe(",
+    "col_total": "Total("
+  },
+  "precio": "^\\s*(\\d{1,3}(?:\\.\\d{3})*,\\d{2})\\s*$",
+  "totales": "^(?P<label>Base Imponible|Total|TOTAL|I\\.V\\.A\\s*(?P<iva>\\d+(?:,\\d+)?)\\s*%)\\s*:\\s*(?P<valor>\\d{1,3}(?:\\.\\d{3})*,\\d{2})\\s*€?\\s*$",
+  "dibujo": {
+    "max_dy": 10,
+    "max_x0": 120
+  },
+  "redaccion": {
+    "_nota": "Plantilla de ejemplo para los tests: no corresponde a ninguna fábrica real.",
+    "zona_logo_fabrica": {
+      "pagina": 1,
+      "rect": [
+        297,
+        0,
+        595,
+        110
+      ]
+    },
+    "lista_negra": [
+      "FABRICA EJEMPLO"
+    ]
+  }
+}

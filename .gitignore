@@ -1,0 +1,10 @@
+# Salida local y cachés
+out/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Nunca en este repo público: PDFs (datos de clientes), plantillas (privadas) y secretos
+*.pdf
+templates/
+.env*
