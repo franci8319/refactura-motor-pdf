@@ -1,0 +1,7 @@
+# Cloud Run --source: solo sube lo que usa el Dockerfile (out/ y tests/ pueden tener datos de clientes)
+*
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!motor.py
+!servicio.py
