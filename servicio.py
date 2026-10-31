@@ -7,7 +7,7 @@ el worker lo descarga de una URL firmada del bucket temporal y sube el generado 
   POST /v1/analizar   {pdf_url, plantilla}
                       → huella, extracción y validación (lo que el montador revisa); cada línea
                         lleva "dibujo_png" (PNG en base64 del dibujo de la ventana, o null)
-  POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?}
+  POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?, conservar_fabrica?}
                       → redacción, estampado, verificación de salida y subida del PDF (PUT a salida_url)
                         marca = {logo?: PNG/JPEG en base64, datos?: [líneas], pie?: [líneas]}; necesita
                         que la plantilla defina sus zonas ("marca")
@@ -119,6 +119,7 @@ class PeticionGenerar(PeticionAnalizar):
     montaje: Decimal | None = Field(default=None, ge=0, le=1_000_000, decimal_places=2)
     pct_lineas: dict[int, Pct] = Field(default_factory=dict)
     marca: PeticionMarca | None = None
+    conservar_fabrica: bool = False  # deja el logo y el nombre de la fábrica; los precios se eliminan siempre
 
     @model_validator(mode="after")
     def _pcts(self) -> PeticionGenerar:
@@ -214,7 +215,8 @@ def crear_app(cfg: Config | None = None, transporte: httpx.BaseTransport | None 
         _comprobar_url(p.salida_url, cfg, "salida_url")
         marca = p.marca.a_motor() if p.marca else None
         pdf = _descargar(cliente, p.pdf_url, cfg)
-        r = _con_motor(motor.generar, pdf, T, p.pct, p.modo, p.montaje, p.pct_lineas, marca)
+        r = _con_motor(motor.generar, pdf, T, p.pct, p.modo, p.montaje, p.pct_lineas, marca,
+                       p.conservar_fabrica)
         if not r.ok:
             return {**r.datos, "entregado": False}
         _subir(cliente, p.salida_url, r.pdf)

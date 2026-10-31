@@ -42,13 +42,14 @@ def load_template(path: Path) -> dict:
     return compile_template(json.loads(path.read_text(encoding="utf-8")), f"plantilla {path.name}")
 
 
-def process(src: Path, pct: Decimal, modo: str, montaje: Decimal | None, T: dict, marca: Marca) -> dict:
+def process(src: Path, pct: Decimal, modo: str, montaje: Decimal | None, T: dict, marca: Marca,
+            conservar_fabrica: bool = False) -> dict:
     out = OUT_DIR / src.stem
     out.mkdir(parents=True, exist_ok=True)
     # No dejar salida ni miniaturas viejas junto a un needs_review.
     for viejo in [out / "salida.pdf", *out.glob("p*.png")]:
         viejo.unlink(missing_ok=True)
-    r = generar(src.read_bytes(), T, pct, modo, montaje, marca=marca)
+    r = generar(src.read_bytes(), T, pct, modo, montaje, marca=marca, conservar_fabrica=conservar_fabrica)
     if r.ok:
         (out / "salida.pdf").write_bytes(r.pdf)
         for i, png in enumerate(r.miniaturas, 1):
@@ -71,6 +72,7 @@ def main() -> int:
     ap.add_argument("--logo", type=Path, help="logo del montador (PNG o JPEG)")
     ap.add_argument("--dato", action="append", default=[], help="línea de datos del montador (repetible)")
     ap.add_argument("--pie", action="append", default=[], help="línea del pie del montador (repetible)")
+    ap.add_argument("--conservar-fabrica", action="store_true", help="deja el logo y el nombre de la fábrica")
     args = ap.parse_args()
     try:
         T = load_template(args.plantilla)
@@ -85,7 +87,7 @@ def main() -> int:
 
     fallos = 0
     for src in pdfs:
-        r = process(src, args.pct, args.modo, args.montaje, T, marca)
+        r = process(src, args.pct, args.modo, args.montaje, T, marca, args.conservar_fabrica)
         print(f"\n== {src.name}: {r['estado'].upper()} ({len(r['lineas'])} líneas, {r['n_dibujos']} dibujos)")
         for ln in r["lineas"]:
             extra = f" -> {fmt_eur(ln['total'])}" if "total" in ln else ""

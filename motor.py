@@ -341,11 +341,14 @@ def tam_texto(lineas: list[str], zona: tuple, tams: tuple[float, float]) -> floa
     return None
 
 
-def validate_marca(marca: Marca, T: dict) -> list[str]:
+def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> list[str]:
     """Errores de configuración de la marca, no del PDF: llevan el prefijo "marca:" para que la app
     pida corregir los ajustes en lugar de dejar el presupuesto en revisión."""
     if marca.vacia:
         return []
+    if conservar_fabrica and marca.datos:
+        # Los datos van en el hueco del logo de fábrica: si el logo se conserva, no hay sitio.
+        return ["marca: con el logo de la fábrica conservado, los datos de empresa no tienen hueco (usa el pie)"]
     M = T["marca"]
     if M is None:
         return [f"marca: la plantilla {T['id']} no define zonas para la marca del montador"]
@@ -439,7 +442,8 @@ def zonas_marca(marca: Marca | None, T: dict, n: int) -> list[tuple]:
     return zonas
 
 
-def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Marca | None = None) -> bytes:
+def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Marca | None = None,
+                     conservar_fabrica: bool = False) -> bytes:
     doc = fitz.open(stream=pdf, filetype="pdf")
     labels = {"Base Imponible": "Base Imponible", "Total": "Total", "TOTAL": "TOTAL"}
     for page in doc:
@@ -452,12 +456,13 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
             page.add_redact_annot(pad(ln.rect_total), fill=False)
         for t in (t for t in ex.totales if t.pagina == n):
             page.add_redact_annot(pad(t.rect), fill=False)
-        # Datos de fábrica.
-        if n == T["logo_pagina"]:
-            page.add_redact_annot(fitz.Rect(T["zona_logo_fabrica"]), fill=False)
-        for palabra in T["lista_negra"]:
-            for r in page.search_for(palabra):
-                page.add_redact_annot(pad(tuple(r)), fill=False)
+        # Datos de fábrica (salvo que el montador elija conservar su logo y su nombre).
+        if not conservar_fabrica:
+            if n == T["logo_pagina"]:
+                page.add_redact_annot(fitz.Rect(T["zona_logo_fabrica"]), fill=False)
+            for palabra in T["lista_negra"]:
+                for r in page.search_for(palabra):
+                    page.add_redact_annot(pad(tuple(r)), fill=False)
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE,
                               graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                               text=fitz.PDF_REDACT_TEXT_REMOVE)
@@ -539,7 +544,7 @@ def verify_marca(doc: fitz.Document, marca: Marca, T: dict) -> list[str]:
 
 
 def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
-           marca: Marca | None = None) -> tuple[list[str], list[bytes]]:
+           marca: Marca | None = None, conservar_fabrica: bool = False) -> tuple[list[str], list[bytes]]:
     """Verificación de salida obligatoria (sección 'Redacción real y verificación de salida').
 
     Devuelve los errores y una miniatura PNG por página para la pantalla de descarga.
@@ -557,7 +562,7 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
             err.append(f"precio de fábrica {v} sigue en el texto")
 
     bajo = texto.lower()
-    for palabra in T["lista_negra"]:
+    for palabra in ([] if conservar_fabrica else T["lista_negra"]):
         if palabra.lower() in bajo:
             err.append(f"dato de fábrica '{palabra}' sigue en el texto")
 
@@ -573,7 +578,7 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
     if any(list(p.annots()) or list(p.widgets()) for p in doc):
         err.append("anotaciones o formularios presentes")
     zona_logo = fitz.Rect(T["zona_logo_fabrica"])
-    if any(fitz.Rect(i["bbox"]).intersects(zona_logo) for i in doc[T["logo_pagina"]].get_image_info()):
+    if not conservar_fabrica and             any(fitz.Rect(i["bbox"]).intersects(zona_logo) for i in doc[T["logo_pagina"]].get_image_info()):
         err.append("logo de fábrica sigue en la cabecera")
     if marca is not None:
         err += verify_marca(doc, marca, T)
@@ -671,22 +676,25 @@ def analizar(pdf: bytes, T: dict) -> Resultado:
 
 
 def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: Decimal | None = None,
-            pct_lineas: dict[int, Decimal] | None = None, marca: Marca | None = None) -> Resultado:
-    """Analiza de nuevo (sin estado), calcula, redacta, estampa y verifica la salida."""
+            pct_lineas: dict[int, Decimal] | None = None, marca: Marca | None = None,
+            conservar_fabrica: bool = False) -> Resultado:
+    """Analiza de nuevo (sin estado), calcula, redacta, estampa y verifica la salida.
+
+    conservar_fabrica: deja el logo y el nombre de la fábrica (los precios se eliminan siempre)."""
     pct_lineas = pct_lineas or {}
     marca = marca or Marca()
     ex, errores = _analisis(pdf, T)
     if not errores:
-        errores = validate_params(ex, montaje, pct_lineas) + validate_marca(marca, T)
+        errores = validate_params(ex, montaje, pct_lineas) + validate_marca(marca, T, conservar_fabrica)
     datos = {"plantilla": T["id"], "pct": pct, "modo": modo, "montaje": montaje,
              "pct_lineas": {str(k): v for k, v in sorted(pct_lineas.items())},
-             "marca": not marca.vacia, "n_dibujos": ex.n_dibujos}
+             "marca": not marca.vacia, "conservar_fabrica": conservar_fabrica, "n_dibujos": ex.n_dibujos}
     calc = salida = None
     miniaturas: list[bytes] = []
     if not errores:
         calc = calcular(ex, pct, modo, montaje, pct_lineas)
-        salida = redact_and_stamp(pdf, ex, calc, T, marca)
-        errores, miniaturas = verify(ex, calc, salida, T, marca)
+        salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica)
+        errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica)
     datos["lineas"] = _lineas_publicas(ex, calc)
     datos["totales"] = {k: calc[k] for k in ("base", "iva_pct", "iva", "total")} if calc else None
     datos["estado"] = "needs_review" if errores else "ok"

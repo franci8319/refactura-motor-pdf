@@ -239,3 +239,38 @@ def test_marca_imposible_needs_review(caso):
     d = generar(cliente(almacen), plantilla=plantilla, marca=marca).json()
     assert d["estado"] == "needs_review" and not almacen.subidas
     assert d["errores"] and all(e.startswith("marca:") for e in d["errores"])
+
+
+@con_samples
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_conservar_fabrica(sample):
+    """Logo y nombre de la fábrica se quedan; los precios se eliminan igual; la marca (sin datos) se aplica."""
+    original = fitz.open(stream=sample.read_bytes(), filetype="pdf")
+    almacen = Almacen(sample.read_bytes())
+    marca = {"logo": MARCA["logo"], "pie": MARCA["pie"]}
+    d = generar(cliente(almacen), conservar_fabrica=True, marca=marca).json()
+    assert d["estado"] == "ok", d["errores"]
+    assert d["conservar_fabrica"] is True and len(almacen.subidas) == 1
+
+    salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
+    red = PLANTILLA["redaccion"]
+    zona = fitz.Rect(red["zona_logo_fabrica"]["rect"])
+    pag = red["zona_logo_fabrica"]["pagina"] - 1
+
+    def imgs(doc):
+        return [i for i in doc[pag].get_image_info() if fitz.Rect(i["bbox"]).intersects(zona)]
+    assert len(imgs(salida)) == len(imgs(original)) > 0
+    texto_o = "".join(p.get_text() for p in original).lower()
+    texto_s = "".join(p.get_text() for p in salida).lower()
+    for n in red["lista_negra"]:
+        assert (n.lower() in texto_s) == (n.lower() in texto_o)
+    for p in salida:
+        assert MARCA["pie"][0] in " ".join(p.get_text().split())
+
+
+@con_samples
+def test_conservar_fabrica_con_datos_es_error_de_marca():
+    almacen = Almacen(SAMPLES[0].read_bytes())
+    d = generar(cliente(almacen), conservar_fabrica=True, marca=MARCA).json()
+    assert d["estado"] == "needs_review" and not almacen.subidas
+    assert d["errores"] and all(e.startswith("marca:") for e in d["errores"])
