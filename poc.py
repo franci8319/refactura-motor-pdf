@@ -14,6 +14,7 @@ Uso:
   python worker/poc.py ruta.pdf --pct 30 --montaje 400
   python worker/poc.py ruta.pdf --pct 30 --modo margen
   python worker/poc.py --plantilla templates/<fabrica>-v1.json
+  python worker/poc.py ruta.pdf --logo logo.png --dato "Mi Empresa S.L." --dato "NIF B1234" --pie "..."
 
 Salida en worker/out/<nombre>/: salida.pdf, resultado.json y miniaturas PNG.
 Código de salida 1 si algún PDF queda en needs_review.
@@ -27,27 +28,27 @@ import sys
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
-from motor import CENT, compile_template, fmt_eur, generar, jsonable, parse_pct
+from motor import CENT, Marca, compile_template, fmt_eur, generar, jsonable, parse_pct
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = Path(__file__).resolve().parent / "out"
 
-# Plantilla por defecto para la PoC: la primera de templates/ (carpeta privada, fuera de este repo).
+# Plantilla por defecto para la PoC: la última de templates/ (carpeta privada, fuera de este repo).
 # En el producto llega por HTTP (JSON versionado en Supabase) y nunca vive en el repo público del worker.
-DEFAULT_TEMPLATE = next(iter(sorted((ROOT / "templates").glob("*.json"))), None)
+DEFAULT_TEMPLATE = next(iter(sorted((ROOT / "templates").glob("*.json"), reverse=True)), None)
 
 
 def load_template(path: Path) -> dict:
     return compile_template(json.loads(path.read_text(encoding="utf-8")), f"plantilla {path.name}")
 
 
-def process(src: Path, pct: Decimal, modo: str, montaje: Decimal | None, T: dict) -> dict:
+def process(src: Path, pct: Decimal, modo: str, montaje: Decimal | None, T: dict, marca: Marca) -> dict:
     out = OUT_DIR / src.stem
     out.mkdir(parents=True, exist_ok=True)
     # No dejar salida ni miniaturas viejas junto a un needs_review.
     for viejo in [out / "salida.pdf", *out.glob("p*.png")]:
         viejo.unlink(missing_ok=True)
-    r = generar(src.read_bytes(), T, pct, modo, montaje)
+    r = generar(src.read_bytes(), T, pct, modo, montaje, marca=marca)
     if r.ok:
         (out / "salida.pdf").write_bytes(r.pdf)
         for i, png in enumerate(r.miniaturas, 1):
@@ -67,6 +68,9 @@ def main() -> int:
                     help="precio unitario de montaje del montador, sin %% (p. ej. 400 o 400,50)")
     ap.add_argument("--plantilla", type=Path, default=DEFAULT_TEMPLATE, required=DEFAULT_TEMPLATE is None,
                     help="JSON de plantilla")
+    ap.add_argument("--logo", type=Path, help="logo del montador (PNG o JPEG)")
+    ap.add_argument("--dato", action="append", default=[], help="línea de datos del montador (repetible)")
+    ap.add_argument("--pie", action="append", default=[], help="línea del pie del montador (repetible)")
     args = ap.parse_args()
     try:
         T = load_template(args.plantilla)
@@ -77,10 +81,11 @@ def main() -> int:
     if args.montaje is not None and args.montaje < 0:
         ap.error("el montaje no puede ser negativo")
     pdfs = args.pdfs or sorted((ROOT / "samples").glob("*.pdf"))
+    marca = Marca(args.logo.read_bytes() if args.logo else None, args.dato, args.pie)
 
     fallos = 0
     for src in pdfs:
-        r = process(src, args.pct, args.modo, args.montaje, T)
+        r = process(src, args.pct, args.modo, args.montaje, T, marca)
         print(f"\n== {src.name}: {r['estado'].upper()} ({len(r['lineas'])} líneas, {r['n_dibujos']} dibujos)")
         for ln in r["lineas"]:
             extra = f" -> {fmt_eur(ln['total'])}" if "total" in ln else ""

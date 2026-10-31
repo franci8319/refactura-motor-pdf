@@ -22,7 +22,8 @@ import servicio  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 REALES = sorted((ROOT / "templates").glob("*.json"))
-PLANTILLA = json.loads((REALES[0] if REALES else Path(__file__).with_name("plantilla_ejemplo.json"))
+# La última versión real (la que define zonas de marca); si no hay, la de ejemplo.
+PLANTILLA = json.loads((REALES[-1] if REALES else Path(__file__).with_name("plantilla_ejemplo.json"))
                        .read_text(encoding="utf-8"))
 ID_PLANTILLA = f"{PLANTILLA['id']}-v{PLANTILLA['version']}"
 SAMPLES = sorted((ROOT / "samples").glob("*.pdf")) if REALES else []
@@ -184,3 +185,57 @@ def test_pct_lineas_invalido_needs_review(pct_lineas):
     d = generar(cliente(almacen), pct_lineas=pct_lineas).json()
     assert d["estado"] == "needs_review" and any("pct_lineas" in e for e in d["errores"])
     assert not almacen.subidas
+
+
+def png(w: int = 400, h: int = 100) -> bytes:
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, w, h), False)
+    pix.set_rect(pix.irect, (0, 118, 111))
+    return pix.tobytes("png")
+
+
+MARCA = {"logo": base64.b64encode(png()).decode("ascii"),
+         "datos": ["Ventanas Ejemplo S.L.", "NIF B12345678", "Tel. 958 000 000 · info@ejemplo.es"],
+         "pie": ["Ventanas Ejemplo S.L. · C/ Mayor 12, 18001 Granada"]}
+
+
+@pytest.mark.parametrize("marca", [{"logo": "no es base64!"}, {"datos": ["x"] * 7}, {"pie": [""]},
+                                   {"otro": 1}])
+def test_marca_no_valida_400(marca):
+    almacen = Almacen()
+    assert generar(cliente(almacen), marca=marca).status_code == 400
+    assert not almacen.subidas
+
+
+@con_samples
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_generar_con_marca(sample):
+    almacen = Almacen(sample.read_bytes())
+    d = generar(cliente(almacen), marca=MARCA).json()
+    assert d["estado"] == "ok", d["errores"]
+    assert d["marca"] is True and len(almacen.subidas) == 1
+
+    salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
+    zonas = PLANTILLA["marca"]
+    zona_logo = fitz.Rect(zonas["zona_logo"]["rect"])
+    imgs = [i for i in salida[0].get_image_info() if fitz.Rect(i["bbox"]).intersects(zona_logo)]
+    assert len(imgs) == 1  # solo el logo nuevo
+    texto = " ".join(salida[0].get_text().split())
+    assert all(l in texto for l in MARCA["datos"])
+    for p in salida:
+        assert MARCA["pie"][0] in " ".join(p.get_text().split())
+
+
+@con_samples
+@pytest.mark.parametrize("caso", ["sin_zonas", "logo_gif", "no_cabe"])
+def test_marca_imposible_needs_review(caso):
+    plantilla, marca = PLANTILLA, dict(MARCA)
+    if caso == "sin_zonas":
+        plantilla = {k: v for k, v in PLANTILLA.items() if k != "marca"}
+    elif caso == "logo_gif":
+        marca["logo"] = base64.b64encode(b"GIF89a" + b"0" * 20).decode("ascii")
+    else:
+        marca["datos"] = ["M" * 200]
+    almacen = Almacen(SAMPLES[0].read_bytes())
+    d = generar(cliente(almacen), plantilla=plantilla, marca=marca).json()
+    assert d["estado"] == "needs_review" and not almacen.subidas
+    assert d["errores"] and all(e.startswith("marca:") for e in d["errores"])

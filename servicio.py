@@ -7,8 +7,10 @@ el worker lo descarga de una URL firmada del bucket temporal y sube el generado 
   POST /v1/analizar   {pdf_url, plantilla}
                       → huella, extracción y validación (lo que el montador revisa); cada línea
                         lleva "dibujo_png" (PNG en base64 del dibujo de la ventana, o null)
-  POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?}
+  POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?}
                       → redacción, estampado, verificación de salida y subida del PDF (PUT a salida_url)
+                        marca = {logo?: PNG/JPEG en base64, datos?: [líneas], pie?: [líneas]}; necesita
+                        que la plantilla defina sus zonas ("marca")
 
 Respuestas 200 con "estado": "ok" | "needs_review". En needs_review no se sube nada.
 Importes en JSON como texto con punto decimal ("1300.00"); en la entrada también se aceptan números.
@@ -89,12 +91,34 @@ class PeticionAnalizar(BaseModel):
     plantilla: dict
 
 
+MAX_LOGO = 300 * 1024
+Linea = Annotated[str, Field(min_length=1, max_length=200)]
+
+
+class PeticionMarca(BaseModel):
+    """Marca del montador. logo: PNG o JPEG en base64; datos y pie: líneas de texto ya compuestas."""
+    model_config = ConfigDict(extra="forbid")
+    logo: str | None = Field(default=None, max_length=(MAX_LOGO + 2) // 3 * 4)
+    datos: list[Linea] = Field(default_factory=list, max_length=6)
+    pie: list[Linea] = Field(default_factory=list, max_length=3)
+
+    def a_motor(self) -> motor.Marca:
+        logo = None
+        if self.logo is not None:
+            try:
+                logo = base64.b64decode(self.logo, validate=True)
+            except ValueError as e:
+                raise ErrorPeticion(400, "marca.logo: base64 no válido") from e
+        return motor.Marca(logo, list(self.datos), list(self.pie))
+
+
 class PeticionGenerar(PeticionAnalizar):
     salida_url: str
     pct: Pct
     modo: Literal["markup", "margen"] = "markup"
     montaje: Decimal | None = Field(default=None, ge=0, le=1_000_000, decimal_places=2)
     pct_lineas: dict[int, Pct] = Field(default_factory=dict)
+    marca: PeticionMarca | None = None
 
     @model_validator(mode="after")
     def _pcts(self) -> PeticionGenerar:
@@ -188,8 +212,9 @@ def crear_app(cfg: Config | None = None, transporte: httpx.BaseTransport | None 
         T = _plantilla(p.plantilla)
         _comprobar_url(p.pdf_url, cfg, "pdf_url")
         _comprobar_url(p.salida_url, cfg, "salida_url")
+        marca = p.marca.a_motor() if p.marca else None
         pdf = _descargar(cliente, p.pdf_url, cfg)
-        r = _con_motor(motor.generar, pdf, T, p.pct, p.modo, p.montaje, p.pct_lineas)
+        r = _con_motor(motor.generar, pdf, T, p.pct, p.modo, p.montaje, p.pct_lineas, marca)
         if not r.ok:
             return {**r.datos, "entregado": False}
         _subir(cliente, p.salida_url, r.pdf)

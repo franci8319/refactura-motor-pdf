@@ -50,5 +50,10 @@
     "lista_negra": [
       "FABRICA EJEMPLO"
     ]
+  },
+  "marca": {
+    "zona_logo": {"pagina": 1, "rect": [55, 12, 290, 106]},
+    "zona_datos": {"pagina": 1, "rect": [300, 12, 559, 106]},
+    "zona_pie": {"rect": [55, 778, 525, 828]}
   }
 }

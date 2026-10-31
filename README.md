@@ -18,7 +18,7 @@ Es el motor de [refactura.es](https://refactura.es). Se publica bajo AGPL-3.0 po
 | --- | --- |
 | `GET /salud` | `{"ok": true}` |
 | `POST /v1/analizar` | `{pdf_url, plantilla}` → huella, líneas (con el dibujo de cada ventana en PNG), totales y validación |
-| `POST /v1/generar` | `{pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?}` → redacción, estampado, verificación y subida |
+| `POST /v1/generar` | `{pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?}` → redacción, estampado, verificación y subida. `marca = {logo?, datos?, pie?}` (logo PNG/JPEG en base64, líneas de texto) va en las zonas `marca` de la plantilla |
 
 Importes en JSON como texto con punto decimal (`"1300.00"`). Detalle en la cabecera de `servicio.py`.
 

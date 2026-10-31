@@ -29,6 +29,7 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
     try:
         a, red, dib = raw["anclas"], raw["redaccion"], raw["dibujo"]
         logo = red["zona_logo_fabrica"]
+        marca = raw.get("marca")
         return {
             "id": f"{raw['id']}-v{raw['version']}",
             "huella": raw["huella"],
@@ -45,6 +46,14 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             "logo_pagina": logo["pagina"] - 1,
             "zona_logo_fabrica": tuple(logo["rect"]),  # x0, y0, x1, y1
             "lista_negra": red["lista_negra"],
+            # Opcional: dónde va la marca del montador (logo y datos en la pág. indicada, pie en todas).
+            "marca": None if marca is None else {
+                "logo_pagina": marca["zona_logo"]["pagina"] - 1,
+                "zona_logo": tuple(marca["zona_logo"]["rect"]),
+                "datos_pagina": marca["zona_datos"]["pagina"] - 1,
+                "zona_datos": tuple(marca["zona_datos"]["rect"]),
+                "zona_pie": tuple(marca["zona_pie"]["rect"]),
+            },
         }
     except (KeyError, TypeError, re.error) as e:
         raise ValueError(f"{nombre} no válida: {e!r}") from e
@@ -128,6 +137,25 @@ class Resultado:
     @property
     def ok(self) -> bool:
         return self.datos["estado"] == "ok"
+
+
+@dataclass
+class Marca:
+    """Marca del montador: logo (PNG/JPEG) en lugar del de la cabecera, líneas de datos en el hueco
+    del logo de fábrica y, si hay pie, sustituye el pie de todas las páginas. Todo opcional."""
+    logo: bytes | None = None
+    datos: list[str] = field(default_factory=list)
+    pie: list[str] = field(default_factory=list)
+
+    @property
+    def vacia(self) -> bool:
+        return not (self.logo or self.datos or self.pie)
+
+
+MAX_LADO_LOGO = 4000  # px; se comprueba en la cabecera antes de decodificar
+TAM_DATOS = (9.0, 6.0)  # pt máx. y mín.: el texto se reduce hasta caber en su zona
+TAM_PIE = (7.0, 5.5)
+INTERLINEA = 1.3
 
 
 def page_spans(page: fitz.Page) -> list[Span]:
@@ -271,6 +299,80 @@ def validate_params(ex: Extraccion, montaje: Decimal | None, pct_lineas: dict[in
     return err
 
 
+def dimensiones_imagen(b: bytes) -> tuple[int, int] | None:
+    """Ancho y alto de un PNG o JPEG leyendo solo la cabecera (sin decodificar: evita bombas)."""
+    if b.startswith(b"\x89PNG\r\n\x1a\n") and b[12:16] == b"IHDR":
+        return int.from_bytes(b[16:20], "big"), int.from_bytes(b[20:24], "big")
+    if b.startswith(b"\xff\xd8"):
+        i = 2
+        while i + 9 < len(b) and b[i] == 0xFF:
+            marcador, largo = b[i + 1], int.from_bytes(b[i + 2:i + 4], "big")
+            if 0xC0 <= marcador <= 0xCF and marcador not in (0xC4, 0xC8, 0xCC):  # SOFn
+                return int.from_bytes(b[i + 7:i + 9], "big"), int.from_bytes(b[i + 5:i + 7], "big")
+            i += 2 + largo
+    return None
+
+
+def logo_pixmap(b: bytes) -> fitz.Pixmap:
+    """Decodifica y normaliza a RGB: al insertarlo se re-codifica, sin EXIF ni otros metadatos."""
+    pix = fitz.Pixmap(b)
+    if pix.colorspace is None or pix.colorspace.n != 3:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+    return pix
+
+
+def rect_logo(w: int, h: int, zona: tuple) -> fitz.Rect:
+    """Logo ajustado a la zona conservando la proporción, alineado a la izquierda y centrado en vertical."""
+    z = fitz.Rect(zona)
+    k = min(z.width / w, z.height / h)
+    y0 = z.y0 + (z.height - h * k) / 2
+    return fitz.Rect(z.x0, y0, z.x0 + w * k, y0 + h * k)
+
+
+def tam_texto(lineas: list[str], zona: tuple, tams: tuple[float, float]) -> float | None:
+    """Mayor tamaño (en pasos de 0,25 pt) con el que todas las líneas caben en la zona; None si no caben."""
+    z = fitz.Rect(zona)
+    t = tams[0]
+    while t >= tams[1]:
+        if len(lineas) * t * INTERLINEA <= z.height and \
+                max(FONT.text_length(l, fontsize=t) for l in lineas) <= z.width:
+            return t
+        t -= 0.25
+    return None
+
+
+def validate_marca(marca: Marca, T: dict) -> list[str]:
+    """Errores de configuración de la marca, no del PDF: llevan el prefijo "marca:" para que la app
+    pida corregir los ajustes en lugar de dejar el presupuesto en revisión."""
+    if marca.vacia:
+        return []
+    M = T["marca"]
+    if M is None:
+        return [f"marca: la plantilla {T['id']} no define zonas para la marca del montador"]
+    err = []
+    if marca.logo is not None:
+        dim = dimensiones_imagen(marca.logo)
+        if dim is None:
+            err.append("marca: el logo tiene que ser PNG o JPEG")
+        elif not (0 < dim[0] <= MAX_LADO_LOGO and 0 < dim[1] <= MAX_LADO_LOGO):
+            err.append(f"marca: el logo mide {dim[0]}×{dim[1]} px (máximo {MAX_LADO_LOGO} por lado)")
+        else:
+            try:
+                logo_pixmap(marca.logo)
+            except (RuntimeError, ValueError):
+                err.append("marca: el logo no se puede leer")
+    for nombre, lineas, zona, tams in (("datos", marca.datos, M["zona_datos"], TAM_DATOS),
+                                       ("pie", marca.pie, M["zona_pie"], TAM_PIE)):
+        if not lineas:
+            continue
+        raros = sorted({c for l in lineas for c in l if not FONT.has_glyph(ord(c))})
+        if raros:
+            err.append(f"marca: {nombre} con caracteres no admitidos {raros}")
+        elif tam_texto(lineas, zona, tams) is None:
+            err.append(f"marca: el texto de {nombre} no cabe; acórtalo")
+    return err
+
+
 def precio_cliente(coste: Decimal, pct: Decimal, modo: str) -> Decimal:
     p = pct / 100
     v = coste * (1 + p) if modo == "markup" else coste / (1 - p)
@@ -306,11 +408,44 @@ def pad(r: tuple, d: float = 0.5) -> fitz.Rect:
     return fitz.Rect(r[0] - d, r[1] - d, r[2] + d, r[3] + d)
 
 
-def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict) -> bytes:
+def stamp_bloque(page: fitz.Page, lineas: list[str], zona: tuple, tams: tuple[float, float],
+                 derecha: bool) -> None:
+    """Líneas centradas en vertical en la zona, alineadas a la izquierda o a la derecha."""
+    z = fitz.Rect(zona)
+    t = tam_texto(lineas, zona, tams)
+    assert t is not None  # validate_marca ya lo comprobó
+    paso = t * INTERLINEA
+    y = z.y0 + (z.height - paso * len(lineas)) / 2 + t
+    for linea in lineas:
+        if derecha:
+            stamp_right(page, linea, z.x1, y, t, 0)
+        else:
+            page.insert_text((z.x0, y), linea, fontname=FONT_NAME, fontsize=t, color=(0, 0, 0))
+        y += paso
+
+
+def zonas_marca(marca: Marca | None, T: dict, n: int) -> list[tuple]:
+    """Zonas de la página n que se vacían para la marca del montador."""
+    if marca is None or marca.vacia:
+        return []
+    M = T["marca"]
+    zonas = []
+    if marca.logo and n == M["logo_pagina"]:
+        zonas.append(M["zona_logo"])
+    if marca.datos and n == M["datos_pagina"]:
+        zonas.append(M["zona_datos"])
+    if marca.pie:
+        zonas.append(M["zona_pie"])
+    return zonas
+
+
+def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Marca | None = None) -> bytes:
     doc = fitz.open(stream=pdf, filetype="pdf")
     labels = {"Base Imponible": "Base Imponible", "Total": "Total", "TOTAL": "TOTAL"}
     for page in doc:
         n = page.number
+        for z in zonas_marca(marca, T, n):
+            page.add_redact_annot(fitz.Rect(z), fill=False)
         # Precios y totales: redacción sin relleno para conservar el fondo de las filas.
         for ln in (l for l in ex.lineas if l.pagina == n):
             page.add_redact_annot(pad(ln.rect_importe), fill=False)
@@ -341,6 +476,16 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict) -> bytes:
                 txt = f"{labels[t.label]}: {fmt_eur(valor)} €"
             stamp_right(page, txt, t.rect[2], t.origin[1], t.size, t.color)
 
+        if marca is not None and not marca.vacia:
+            M = T["marca"]
+            if marca.logo and n == M["logo_pagina"]:
+                pix = logo_pixmap(marca.logo)
+                page.insert_image(rect_logo(pix.width, pix.height, M["zona_logo"]), pixmap=pix)
+            if marca.datos and n == M["datos_pagina"]:
+                stamp_bloque(page, marca.datos, M["zona_datos"], TAM_DATOS, derecha=True)
+            if marca.pie:
+                stamp_bloque(page, marca.pie, M["zona_pie"], TAM_PIE, derecha=False)
+
     # Limpieza de todo lo que no sea contenido visible.
     doc.set_metadata({})
     doc.del_xml_metadata()
@@ -367,7 +512,34 @@ def money_regex(valor: str) -> re.Pattern:
     return re.compile(rf"(?<![\d.,])(?:{alt})(?![\d,]|\.\d)")
 
 
-def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict) -> tuple[list[str], list[bytes]]:
+def _normal(s: str) -> str:
+    return " ".join(s.split())
+
+
+def verify_marca(doc: fitz.Document, marca: Marca, T: dict) -> list[str]:
+    """La marca está donde debe: un único logo (el nuevo) en su zona y cada línea de texto en su página."""
+    if marca.vacia:
+        return []
+    M, err = T["marca"], []
+    if marca.logo:
+        zona = fitz.Rect(M["zona_logo"])
+        imgs = [fitz.Rect(i["bbox"]) for i in doc[M["logo_pagina"]].get_image_info()
+                if fitz.Rect(i["bbox"]).intersects(zona)]
+        if len(imgs) != 1 or not pad(tuple(zona), 1).contains(imgs[0]):
+            err.append(f"zona del logo del montador con {len(imgs)} imágenes (se esperaba solo el nuevo)")
+    textos = [_normal(p.get_text()) for p in doc]
+    for linea in marca.datos:
+        if _normal(linea) not in textos[M["datos_pagina"]]:
+            err.append("datos del montador no estampados")
+            break
+    for i, texto in enumerate(textos):
+        if any(_normal(l) not in texto for l in marca.pie):
+            err.append(f"p{i + 1}: pie del montador no estampado")
+    return err
+
+
+def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
+           marca: Marca | None = None) -> tuple[list[str], list[bytes]]:
     """Verificación de salida obligatoria (sección 'Redacción real y verificación de salida').
 
     Devuelve los errores y una miniatura PNG por página para la pantalla de descarga.
@@ -403,6 +575,8 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict) -> tuple[list[st
     zona_logo = fitz.Rect(T["zona_logo_fabrica"])
     if any(fitz.Rect(i["bbox"]).intersects(zona_logo) for i in doc[T["logo_pagina"]].get_image_info()):
         err.append("logo de fábrica sigue en la cabecera")
+    if marca is not None:
+        err += verify_marca(doc, marca, T)
 
     out_ex = extract(doc, T)
     if len(out_ex.lineas) != len(calc["lineas"]):
@@ -497,21 +671,22 @@ def analizar(pdf: bytes, T: dict) -> Resultado:
 
 
 def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: Decimal | None = None,
-            pct_lineas: dict[int, Decimal] | None = None) -> Resultado:
+            pct_lineas: dict[int, Decimal] | None = None, marca: Marca | None = None) -> Resultado:
     """Analiza de nuevo (sin estado), calcula, redacta, estampa y verifica la salida."""
     pct_lineas = pct_lineas or {}
+    marca = marca or Marca()
     ex, errores = _analisis(pdf, T)
     if not errores:
-        errores = validate_params(ex, montaje, pct_lineas)
+        errores = validate_params(ex, montaje, pct_lineas) + validate_marca(marca, T)
     datos = {"plantilla": T["id"], "pct": pct, "modo": modo, "montaje": montaje,
              "pct_lineas": {str(k): v for k, v in sorted(pct_lineas.items())},
-             "n_dibujos": ex.n_dibujos}
+             "marca": not marca.vacia, "n_dibujos": ex.n_dibujos}
     calc = salida = None
     miniaturas: list[bytes] = []
     if not errores:
         calc = calcular(ex, pct, modo, montaje, pct_lineas)
-        salida = redact_and_stamp(pdf, ex, calc, T)
-        errores, miniaturas = verify(ex, calc, salida, T)
+        salida = redact_and_stamp(pdf, ex, calc, T, marca)
+        errores, miniaturas = verify(ex, calc, salida, T, marca)
     datos["lineas"] = _lineas_publicas(ex, calc)
     datos["totales"] = {k: calc[k] for k in ("base", "iva_pct", "iva", "total")} if calc else None
     datos["estado"] = "needs_review" if errores else "ok"
