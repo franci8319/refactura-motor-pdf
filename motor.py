@@ -1150,9 +1150,23 @@ def verify_zonas_fabrica(doc: fitz.Document, T: dict, marca: Marca | None) -> li
     return err
 
 
+def importes_estampados(ex: Extraccion, calc: dict) -> list[str]:
+    """Todo importe que escribe Refactura en el PDF (para no confundirlo con un precio de fábrica)."""
+    out = []
+    for ln, c in zip(ex.lineas, calc["lineas"]):
+        if ln.tipo == "descuento":
+            continue
+        unit = c["importe"] if ln.cantidad is None else (c["total"] / ln.cantidad).quantize(CENT, ROUND_HALF_UP)
+        out += [fmt_eur(unit), fmt_eur(c["total"])]
+    out += [fmt_eur(v) for v in calc["subtotales"]]
+    out += [fmt_eur(calc[k]) for k in ("base", "base", "iva", "total")]  # Base Imponible, Total, IVA, TOTAL
+    out += [fmt_eur(c["importe"]) for c in calc["conceptos"]]
+    return out
+
+
 def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | None = None,
            conservar_fabrica: bool = False, bc: BloqueConceptos | None = None,
-           pc: PlanCondiciones | None = None) -> tuple[list[str], list[bytes]]:
+           pc: PlanCondiciones | None = None, texto_original: str | None = None) -> tuple[list[str], list[bytes]]:
     """Verificación de salida obligatoria (sección 'Redacción real y verificación de salida').
 
     Devuelve los errores y una miniatura PNG por página para la pantalla de descarga.
@@ -1176,8 +1190,22 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | N
     originales = {ln.importe for ln in fabrica} | {ln.total for ln in fabrica} \
         | {ln.precio for ln in fabrica if ln.precio} | {t.valor for t in src_ex.totales} \
         | {st.valor for st in src_ex.subtotales}
+    # Un importe nuevo puede coincidir por casualidad con un precio de fábrica (p. ej. un precio por metro
+    # recalculado igual al de otra línea). Se cuentan las apariciones: las justificadas son las que escribe
+    # Refactura y las que el original ya tenía fuera de sus casillas de precio (metros, medidas…).
+    campos: dict[tuple, str] = {}
+    for ln in fabrica:
+        campos[tuple(ln.rect_total)] = ln.total
+        campos[tuple(ln.rect_importe)] = ln.precio if ln.cantidad is not None else ln.importe
+    campos |= {tuple(t.rect): t.valor for t in src_ex.totales} | {tuple(st.rect): st.valor for st in src_ex.subtotales}
+    escritos = " ".join(importes_estampados(src_ex, calc))
     for v in sorted(originales):
-        if money_regex(v).search(texto):
+        rx = money_regex(v)
+        if not rx.search(texto):
+            continue
+        en_campos = sum(1 for c in campos.values() if parse_eur(c) == parse_eur(v))
+        fuera_de_campos = max(0, len(rx.findall(texto_original)) - en_campos) if texto_original is not None else 0
+        if len(rx.findall(texto)) > len(rx.findall(escritos)) + fuera_de_campos:
             err.append(f"precio de fábrica {v} sigue en el texto")
 
     bajo = texto.lower()
@@ -1348,7 +1376,9 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
     if not errores:
         calc = calcular(ex, pct, modo, montaje, pct_lineas, conceptos, iva_pct)
         salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica, bc, pc)
-        errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica, bc, pc)
+        with fitz.open(stream=pdf, filetype="pdf") as orig:
+            texto_original = "\n".join(p.get_text() for p in orig)
+        errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica, bc, pc, texto_original)
     datos["lineas"] = _lineas_publicas(ex, calc)
     datos["totales"] = {k: calc[k] for k in ("base", "iva_pct", "iva", "total")} if calc else None
     datos["conceptos"] = calc["conceptos"] if calc else [{"texto": c.texto, "importe": c.importe} for c in conceptos]

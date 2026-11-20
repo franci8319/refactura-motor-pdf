@@ -73,3 +73,24 @@ def test_tabla_logo_con_cabecera_de_fabrica_es_error_de_marca(sample):
     d = generar(cliente(almacen), plantilla=PLANTILLA, conservar_fabrica=True, marca={"logo": MARCA["logo"]}).json()
     assert d["estado"] == "needs_review" and not almacen.subidas
     assert d["errores"] and all(e.startswith("marca:") for e in d["errores"])
+
+
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_importe_nuevo_igual_a_un_precio_de_fabrica_no_es_fuga(sample):
+    """Con un 20 %, un precio por metro recalculado coincide con el original de otra línea (106,20)."""
+    T = motor.compile_template(PLANTILLA)
+    for pct in (Decimal(5), Decimal(20), Decimal("37.5")):
+        r = motor.generar(sample.read_bytes(), T, pct)
+        assert r.ok, (pct, r.datos["errores"])
+
+
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_precio_de_fabrica_que_se_queda_se_detecta(sample):
+    """El PDF original (sin redactar) como si fuera la salida: todos sus precios cuentan como fuga."""
+    T = motor.compile_template(PLANTILLA)
+    pdf = sample.read_bytes()
+    ex, _ = motor._analisis(pdf, T)
+    calc = motor.calcular(ex, Decimal(20), "markup", None, {})
+    texto = "\n".join(p.get_text() for p in fitz.open(stream=pdf, filetype="pdf"))
+    err, _ = motor.verify(ex, calc, pdf, T, texto_original=texto)
+    assert any("precio de fábrica" in e for e in err)
