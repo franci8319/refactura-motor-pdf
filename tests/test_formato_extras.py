@@ -191,3 +191,15 @@ def test_conceptos_bajan_lo_que_hay_bajo_los_totales(sample):
         assert ps.get_text().count(frase) == po.get_text().count(frase)
     T = motor.compile_template(PLANTILLA)
     assert len(motor.extract(salida, T).lineas) == sum(1 for ln in d["lineas"] if ln["tipo"] != "descuento")
+
+
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_condiciones_no_invaden_el_pie_ni_el_numero_de_pagina(sample):
+    """Empiecen donde empiecen las condiciones, la zona acaba antes del pie: el del montador y "Pag N" se quedan."""
+    plantilla = _plantilla_con_condiciones()
+    almacen = Almacen(sample.read_bytes())
+    d = generar(cliente(almacen), plantilla=plantilla, marca={"condiciones": CONDICIONES, "pie": MARCA["pie"]}).json()
+    assert d["estado"] == "ok", d["errores"]
+    salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
+    ultima = " ".join(salida[-1].get_text().split())
+    assert MARCA["pie"][0] in ultima and f"Pag {salida.page_count}" in ultima

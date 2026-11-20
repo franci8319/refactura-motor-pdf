@@ -95,6 +95,8 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             "condiciones": None if cond is None else {
                 "ancla": str(cond["ancla"]), "zona": tuple(float(v) for v in cond["zona"]),
                 "tam": tuple(float(v) for v in cond.get("tam", (6.6, 5.0))),
+                # La zona nunca baja de aquí (pt desde el pie de la hoja): el pie y el nº de página se quedan.
+                "margen_inferior": float(cond.get("margen_inferior", 0)),
             },
             # Opcional: líneas que añade el montador ("Otros conceptos": instalación, portes…) en un bloque
             # encima del recuadro de totales, que baja para hacer sitio. "caja" = recuadro de totales relativo
@@ -871,7 +873,8 @@ def plan_condiciones(pdf: bytes, T: dict, marca: Marca, conservar_fabrica: bool,
             if hits:
                 a = hits[0]
                 z0, z1, z2, z3 = C["zona"]
-                zona = fitz.Rect(a.x0 + z0, a.y0 + z1, a.x0 + z2, a.y0 + z3) & page.rect
+                zona = fitz.Rect(a.x0 + z0, a.y0 + z1, a.x0 + z2,
+                                 min(a.y0 + z3, page.rect.height - C["margen_inferior"])) & page.rect
                 n = page.number
                 borrar = fitz.Rect(zona)
                 if bc is not None and bc.mover is not None and bc.pagina == n and zona.intersects(bc.mover):
