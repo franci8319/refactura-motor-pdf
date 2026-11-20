@@ -175,3 +175,19 @@ def test_descuento_de_fabrica_oculto_y_ventanas_partidas():
         assert all(ln.ref not in texto for ln in desc)
         return
     pytest.skip("ningún PDF de este formato trae descuento de fábrica")
+
+
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_conceptos_bajan_lo_que_hay_bajo_los_totales(sample):
+    """Si bajo los totales hay texto (condiciones), baja con ellos: ni se pierde ni se duplica."""
+    almacen = Almacen(sample.read_bytes())
+    d = generar(cliente(almacen), plantilla=PLANTILLA,
+                conceptos=[{"texto": "Instalación", "importe": "4000"}, {"texto": "Portes", "importe": "150"}]).json()
+    assert d["estado"] == "ok", d["errores"]
+    salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
+    original = fitz.open(stream=sample.read_bytes(), filetype="pdf")
+    frase = "Le rogamos que revise"
+    for po, ps in zip(original, salida):
+        assert ps.get_text().count(frase) == po.get_text().count(frase)
+    T = motor.compile_template(PLANTILLA)
+    assert len(motor.extract(salida, T).lineas) == sum(1 for ln in d["lineas"] if ln["tipo"] != "descuento")

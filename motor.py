@@ -666,6 +666,8 @@ class BloqueConceptos:
     x_importe: float  # borde derecho de importes (el de los totales)
     y_titulo: float
     filas: list[tuple[str, str, float]]  # texto, importe "1.234,56 €", línea base
+    # Si bajo los totales hay contenido (p. ej. las condiciones), esta franja baja también `desplazamiento`.
+    mover: fitz.Rect | None = None
 
     @property
     def caja_nueva(self) -> fitz.Rect:
@@ -727,17 +729,50 @@ def plan_conceptos(pdf: bytes, ex: Extraccion, T: dict, conceptos: list[Concepto
                 lineas(page.get_text(clip=caja)) != lineas("\n".join(
                     page.get_text(clip=fitz.Rect(t.rect)) for t in totales)):
             return None, ["conceptos: el recuadro de totales tiene algo más que los totales"]
-        fondo = caja.y1 + desplazamiento
-        libre = fitz.Rect(caja.x0 - 1, caja.y1 + 1, caja.x1 + 1, fondo + 1)
-        ocupado = page.get_text(clip=libre).strip() or \
-            any(fitz.Rect(i["bbox"]).intersects(libre) for i in page.get_image_info()) or \
-            any(fitz.Rect(d["rect"]).intersects(libre) for d in dibujos if d is not recuadro)
-        if fondo > page.rect.height - C["margen_inferior"] or ocupado:
+        limite = page.rect.height - C["margen_inferior"]
+        # Lo que hay bajo el recuadro de totales hasta el límite inferior (el pie queda fuera).
+        debajo = fitz.Rect(0, caja.y1 + 1, page.rect.width, limite)
+        cosas = [fitz.Rect(b[:4]) for b in page.get_text("blocks") if b[4].strip()] + \
+            [fitz.Rect(i["bbox"]) for i in page.get_image_info()] + \
+            [fitz.Rect(d["rect"]) for d in dibujos if d is not recuadro]
+        cosas = [c for c in cosas if c.intersects(debajo)]
+        mover = None
+        if any(c.y0 < caja.y1 + 1 for c in cosas):
+            ocupado = True  # algo empieza a la altura del recuadro: no se puede bajar sin partirlo
+        elif cosas:
+            # Hay contenido debajo: baja con el recuadro si sigue cabiendo antes del pie.
+            fondo_contenido = max(c.y1 for c in cosas)
+            ocupado = fondo_contenido + desplazamiento > limite
+            mover = None if ocupado else fitz.Rect(0, caja.y1 + 1, page.rect.width, fondo_contenido + 1)
+        else:
+            ocupado = caja.y1 + desplazamiento > limite
+        if ocupado:
             return None, [f"conceptos: no caben {len(conceptos)} líneas añadidas en la página de los totales; "
                           "quita alguna o júntalas"]
     trazo = recuadro.get("color") or (0, 0, 0)
     return BloqueConceptos(ancla.pagina, caja, bloque, desplazamiento, size, ancla.color, tuple(trazo),
-                           recuadro.get("width") or 1.0, x_importe, y_titulo, filas), []
+                           recuadro.get("width") or 1.0, x_importe, y_titulo, filas, mover), []
+
+
+def mover_contenido(doc: fitz.Document, page: fitz.Page, zona: fitz.Rect, dy: float) -> None:
+    """Baja `dy` pt lo que hay en `zona` (ya sin datos de fábrica: después de la primera redacción).
+    Se copia la página, se borra de verdad todo lo de fuera de la zona en la copia y se pega más abajo:
+    el PDF no guarda nada oculto fuera del recorte."""
+    tmp = fitz.open()
+    tmp.insert_pdf(doc, from_page=page.number, to_page=page.number)
+    tp = tmp[0]
+    w, h = tp.rect.width, tp.rect.height
+    for r in (fitz.Rect(0, 0, w, zona.y0), fitz.Rect(0, zona.y1, w, h),
+              fitz.Rect(0, zona.y0, zona.x0, zona.y1), fitz.Rect(zona.x1, zona.y0, w, zona.y1)):
+        if not r.is_empty:
+            tp.add_redact_annot(r, fill=False)
+    tp.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED,
+                        text=fitz.PDF_REDACT_TEXT_REMOVE)
+    page.add_redact_annot(zona, fill=False)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                          text=fitz.PDF_REDACT_TEXT_REMOVE)
+    page.show_pdf_page(zona + (0, dy, 0, dy), tmp, 0, clip=zona)
+    tmp.close()
 
 
 def stamp_conceptos(page: fitz.Page, b: BloqueConceptos) -> None:
@@ -785,6 +820,7 @@ class PlanCondiciones:
     zona: fitz.Rect
     lineas: list[str]  # "" = línea en blanco (separación entre párrafos)
     size: float
+    borrar: fitz.Rect | None = None  # zona original (si los conceptos la bajan, se borra esta y se escribe en zona)
 
 
 def limpiar_condiciones(texto: str, T: dict, conservar_fabrica: bool) -> str:
@@ -816,8 +852,8 @@ def envolver(texto: str, ancho: float, size: float) -> list[str]:
     return out
 
 
-def plan_condiciones(pdf: bytes, T: dict, marca: Marca, conservar_fabrica: bool
-                     ) -> tuple[PlanCondiciones | None, list[str]]:
+def plan_condiciones(pdf: bytes, T: dict, marca: Marca, conservar_fabrica: bool,
+                     bc: "BloqueConceptos | None" = None) -> tuple[PlanCondiciones | None, list[str]]:
     """Solo si el montador tiene condiciones y el PDF trae las de la fábrica (donde no, no se añade nada)."""
     C = T["condiciones"]
     if not marca.condiciones or C is None:
@@ -836,6 +872,9 @@ def plan_condiciones(pdf: bytes, T: dict, marca: Marca, conservar_fabrica: bool
                 z0, z1, z2, z3 = C["zona"]
                 zona = fitz.Rect(a.x0 + z0, a.y0 + z1, a.x0 + z2, a.y0 + z3) & page.rect
                 n = page.number
+                borrar = fitz.Rect(zona)
+                if bc is not None and bc.mover is not None and bc.pagina == n and zona.intersects(bc.mover):
+                    zona.y0 += bc.desplazamiento  # los conceptos bajan lo de debajo de los totales
                 break
         else:
             return None, []
@@ -843,7 +882,7 @@ def plan_condiciones(pdf: bytes, T: dict, marca: Marca, conservar_fabrica: bool
     while t >= C["tam"][1]:
         lineas = envolver(texto, zona.width, t)
         if len(lineas) * t * INTERLINEA_CONDICIONES <= zona.height:
-            return PlanCondiciones(n, zona, lineas, t), []
+            return PlanCondiciones(n, zona, lineas, t, borrar), []
         t -= 0.25
     return None, ["marca: las condiciones no caben en la página; acórtalas"]
 
@@ -951,7 +990,7 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
         for z in zonas_marca(marca, T, n):
             page.add_redact_annot(fitz.Rect(z), fill=False)
         if pc is not None and pc.pagina == n:
-            page.add_redact_annot(pc.zona, fill=False)
+            page.add_redact_annot(pc.zona | (pc.borrar or pc.zona), fill=False)
         # Precios y totales: redacción sin relleno para conservar el fondo de las filas.
         for ln in (l for l in ex.lineas if l.pagina == n):
             page.add_redact_annot(pad(ln.rect_importe), fill=False)
@@ -986,6 +1025,9 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
                                   text=fitz.PDF_REDACT_TEXT_REMOVE)
         page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
         dy = 0.0
+        if bc is not None and bc.pagina == n and bc.mover is not None:
+            mover_contenido(doc, page, bc.mover, bc.desplazamiento)
+            page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
         if pc is not None and pc.pagina == n:
             stamp_condiciones(page, pc)
         if bc is not None and bc.pagina == n:
@@ -1296,7 +1338,7 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
         errores = validate_params(ex, montaje, pct_lineas, T) + validate_marca(marca, T, conservar_fabrica)
     if not errores:
         bc, errores = plan_conceptos(pdf, ex, T, conceptos)
-        pc, err_cond = plan_condiciones(pdf, T, marca, conservar_fabrica)
+        pc, err_cond = plan_condiciones(pdf, T, marca, conservar_fabrica, bc)
         errores += err_cond
     datos = {"plantilla": T["id"], "pct": pct, "modo": modo, "montaje": montaje,
              "pct_lineas": {str(k): v for k, v in sorted(pct_lineas.items())},
