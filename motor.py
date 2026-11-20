@@ -22,6 +22,8 @@ MAX_PAGINAS = 60
 # En producción, fuente propia con licencia de incrustación.
 FONT = fitz.Font("hebo")
 FONT_NAME = "MontBold"
+FONT_REG = fitz.Font("helv")  # Nimbus Sans regular, incrustada igual: texto largo (condiciones)
+FONT_REG_NAME = "MontReg"
 
 
 def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
@@ -33,6 +35,7 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
         sin_pos = raw.get("lineas_sin_pos", "otro")
         if sin_pos not in ("otro", "extra"):
             raise ValueError(f"lineas_sin_pos desconocido: {sin_pos!r}")
+        cond = raw.get("condiciones")
         con = raw.get("conceptos")
         if con is not None and con["ancla"] not in ("Base Imponible", "Total", "IVA", "TOTAL"):
             raise ValueError(f"conceptos.ancla desconocida: {con['ancla']!r}")
@@ -53,6 +56,12 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             # Opcional: líneas que añade el montador ("Otros conceptos": instalación, portes…) en un bloque
             # encima del recuadro de totales, que baja para hacer sitio. "caja" = recuadro de totales relativo
             # al ancla: [x0 − x1_ancla, y0 − y0_ancla, x1 − x1_ancla, y1 − y0_ancla].
+            # Opcional: texto de condiciones de la fábrica que el montador puede sustituir por el suyo.
+            # "zona" relativa al ancla (texto que lo abre): [x0 − x0_ancla, y0 − y0_ancla, x1 − x0_ancla, y1 − y0_ancla].
+            "condiciones": None if cond is None else {
+                "ancla": str(cond["ancla"]), "zona": tuple(float(v) for v in cond["zona"]),
+                "tam": tuple(float(v) for v in cond.get("tam", (6.6, 5.0))),
+            },
             "conceptos": None if con is None else {
                 "ancla": con["ancla"], "caja": tuple(float(v) for v in con["caja"]),
                 "margen_inferior": float(con["margen_inferior"]), "max_lineas": int(con.get("max_lineas", 10)),
@@ -174,10 +183,16 @@ class Marca:
     logo: bytes | None = None
     datos: list[str] = field(default_factory=list)
     pie: list[str] = field(default_factory=list)
+    condiciones: str | None = None  # sustituye el texto de condiciones de la fábrica (si el PDF lo trae)
 
     @property
     def vacia(self) -> bool:
-        return not (self.logo or self.datos or self.pie)
+        return not (self.logo or self.datos or self.pie or self.condiciones)
+
+    @property
+    def visual(self) -> bool:
+        """Lo que va en zonas fijas de la plantilla (cabecera y pie)."""
+        return bool(self.logo or self.datos or self.pie)
 
 
 MAX_LADO_LOGO = 4000  # px; se comprueba en la cabecera antes de decodificar
@@ -388,7 +403,7 @@ def tam_texto(lineas: list[str], zona: tuple, tams: tuple[float, float]) -> floa
 def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> list[str]:
     """Errores de configuración de la marca, no del PDF: llevan el prefijo "marca:" para que la app
     pida corregir los ajustes en lugar de dejar el presupuesto en revisión."""
-    if marca.vacia:
+    if not marca.visual:
         return []
     if conservar_fabrica and marca.datos:
         # Los datos van en el hueco del logo de fábrica: si el logo se conserva, no hay sitio.
@@ -555,7 +570,89 @@ def marca_efectiva(marca: Marca, T: dict, conservar_fabrica: bool) -> Marca:
     M = T["marca"]
     if conservar_fabrica or marca.pie or not marca.datos or M is None or M["pie_por_defecto"] != "datos":
         return marca
-    return Marca(marca.logo, marca.datos, pie_de_datos(marca.datos, M["zona_pie"]))
+    return Marca(marca.logo, marca.datos, pie_de_datos(marca.datos, M["zona_pie"]), marca.condiciones)
+
+
+INTERLINEA_CONDICIONES = 1.4
+
+
+@dataclass
+class PlanCondiciones:
+    """Dónde va el texto de condiciones del montador: la zona se vacía y se escribe línea a línea."""
+    pagina: int
+    zona: fitz.Rect
+    lineas: list[str]  # "" = línea en blanco (separación entre párrafos)
+    size: float
+
+
+def limpiar_condiciones(texto: str, T: dict, conservar_fabrica: bool) -> str:
+    """Normaliza espacios y, salvo que se conserve la fábrica, quita su nombre (como en el texto original)."""
+    if not conservar_fabrica:
+        for palabra in sorted(T["lista_negra"], key=len, reverse=True):
+            texto = re.sub(re.escape(palabra), "", texto, flags=re.I)
+    lineas = [" ".join(l.split()) for l in texto.replace("\r\n", "\n").split("\n")]
+    while lineas and not lineas[-1]:
+        lineas.pop()
+    while lineas and not lineas[0]:
+        lineas.pop(0)
+    return "\n".join(lineas)
+
+
+def envolver(texto: str, ancho: float, size: float) -> list[str]:
+    """Cada línea del texto, partida en palabras para que quepa en el ancho; las vacías se mantienen."""
+    out: list[str] = []
+    for parrafo in texto.split("\n"):
+        linea = ""
+        for palabra in parrafo.split():
+            prueba = f"{linea} {palabra}".strip()
+            if linea and FONT_REG.text_length(prueba, fontsize=size) > ancho:
+                out.append(linea)
+                linea = palabra
+            else:
+                linea = prueba
+        out.append(linea)
+    return out
+
+
+def plan_condiciones(pdf: bytes, T: dict, marca: Marca, conservar_fabrica: bool
+                     ) -> tuple[PlanCondiciones | None, list[str]]:
+    """Solo si el montador tiene condiciones y el PDF trae las de la fábrica (donde no, no se añade nada)."""
+    C = T["condiciones"]
+    if not marca.condiciones or C is None:
+        return None, []
+    texto = limpiar_condiciones(marca.condiciones, T, conservar_fabrica)
+    if not texto:
+        return None, []
+    raros = sorted({c for c in texto if c != "\n" and not FONT_REG.has_glyph(ord(c))})
+    if raros:
+        return None, [f"marca: las condiciones llevan caracteres no admitidos {raros}"]
+    with fitz.open(stream=pdf, filetype="pdf") as doc:
+        for page in reversed(doc):
+            hits = page.search_for(C["ancla"])
+            if hits:
+                a = hits[0]
+                z0, z1, z2, z3 = C["zona"]
+                zona = fitz.Rect(a.x0 + z0, a.y0 + z1, a.x0 + z2, a.y0 + z3) & page.rect
+                n = page.number
+                break
+        else:
+            return None, []
+    t = C["tam"][0]
+    while t >= C["tam"][1]:
+        lineas = envolver(texto, zona.width, t)
+        if len(lineas) * t * INTERLINEA_CONDICIONES <= zona.height:
+            return PlanCondiciones(n, zona, lineas, t), []
+        t -= 0.25
+    return None, ["marca: las condiciones no caben en la página; acórtalas"]
+
+
+def stamp_condiciones(page: fitz.Page, pc: PlanCondiciones) -> None:
+    page.insert_font(fontname=FONT_REG_NAME, fontbuffer=FONT_REG.buffer)
+    y = pc.zona.y0 + pc.size
+    for linea in pc.lineas:
+        if linea:
+            page.insert_text((pc.zona.x0, y), linea, fontname=FONT_REG_NAME, fontsize=pc.size, color=(0, 0, 0))
+        y += pc.size * INTERLINEA_CONDICIONES
 
 
 def precio_cliente(coste: Decimal, pct: Decimal, modo: str) -> Decimal:
@@ -630,13 +727,16 @@ def zonas_marca(marca: Marca | None, T: dict, n: int) -> list[tuple]:
 
 
 def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Marca | None = None,
-                     conservar_fabrica: bool = False, bc: BloqueConceptos | None = None) -> bytes:
+                     conservar_fabrica: bool = False, bc: BloqueConceptos | None = None,
+                     pc: PlanCondiciones | None = None) -> bytes:
     doc = fitz.open(stream=pdf, filetype="pdf")
     labels = {"Base Imponible": "Base Imponible", "Total": "Total", "TOTAL": "TOTAL"}
     for page in doc:
         n = page.number
         for z in zonas_marca(marca, T, n):
             page.add_redact_annot(fitz.Rect(z), fill=False)
+        if pc is not None and pc.pagina == n:
+            page.add_redact_annot(pc.zona, fill=False)
         # Precios y totales: redacción sin relleno para conservar el fondo de las filas.
         for ln in (l for l in ex.lineas if l.pagina == n):
             page.add_redact_annot(pad(ln.rect_importe), fill=False)
@@ -657,6 +757,8 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
                               text=fitz.PDF_REDACT_TEXT_REMOVE)
         page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
         dy = 0.0
+        if pc is not None and pc.pagina == n:
+            stamp_condiciones(page, pc)
         if bc is not None and bc.pagina == n:
             stamp_conceptos(page, bc)
             dy = bc.desplazamiento
@@ -760,7 +862,8 @@ def verify_zonas_fabrica(doc: fitz.Document, T: dict, marca: Marca | None) -> li
 
 
 def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | None = None,
-           conservar_fabrica: bool = False, bc: BloqueConceptos | None = None) -> tuple[list[str], list[bytes]]:
+           conservar_fabrica: bool = False, bc: BloqueConceptos | None = None,
+           pc: PlanCondiciones | None = None) -> tuple[list[str], list[bytes]]:
     """Verificación de salida obligatoria (sección 'Redacción real y verificación de salida').
 
     Devuelve los errores y una miniatura PNG por página para la pantalla de descarga.
@@ -807,6 +910,11 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | N
         err += verify_zonas_fabrica(doc, T, marca)
     if marca is not None:
         err += verify_marca(doc, marca, T)
+    if pc is not None:
+        # En la zona solo pueden quedar las condiciones del montador, enteras y en orden.
+        esperado = _normal(" ".join(l for l in pc.lineas if l))
+        if _normal(doc[pc.pagina].get_text(clip=pc.zona)) != esperado:
+            err.append("condiciones del montador no estampadas o con restos del texto original")
 
     out_ex = extract(doc, T)
     if len(out_ex.lineas) != len(calc["lineas"]):
@@ -916,7 +1024,7 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
     T = plantilla_efectiva(T, conservar_fabrica)
     marca = marca_efectiva(marca or Marca(), T, conservar_fabrica)
     ex, errores = _analisis(pdf, T)
-    bc = None
+    bc = pc = None
     if not errores and montaje is not None and not tiene_montaje(ex) and T["conceptos"] is not None:
         # Compatibilidad: montaje sin línea en el PDF = concepto "Instalación".
         conceptos, montaje = [Concepto("Instalación", montaje), *conceptos], None
@@ -924,6 +1032,8 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
         errores = validate_params(ex, montaje, pct_lineas, T) + validate_marca(marca, T, conservar_fabrica)
     if not errores:
         bc, errores = plan_conceptos(pdf, ex, T, conceptos)
+        pc, err_cond = plan_condiciones(pdf, T, marca, conservar_fabrica)
+        errores += err_cond
     datos = {"plantilla": T["id"], "pct": pct, "modo": modo, "montaje": montaje,
              "pct_lineas": {str(k): v for k, v in sorted(pct_lineas.items())},
              "marca": not marca.vacia, "conservar_fabrica": conservar_fabrica, "n_dibujos": ex.n_dibujos}
@@ -931,8 +1041,8 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
     miniaturas: list[bytes] = []
     if not errores:
         calc = calcular(ex, pct, modo, montaje, pct_lineas, conceptos)
-        salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica, bc)
-        errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica, bc)
+        salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica, bc, pc)
+        errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica, bc, pc)
     datos["lineas"] = _lineas_publicas(ex, calc)
     datos["totales"] = {k: calc[k] for k in ("base", "iva_pct", "iva", "total")} if calc else None
     datos["conceptos"] = calc["conceptos"] if calc else [{"texto": c.texto, "importe": c.importe} for c in conceptos]

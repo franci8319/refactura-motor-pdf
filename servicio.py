@@ -10,8 +10,9 @@ el worker lo descarga de una URL firmada del bucket temporal y sube el generado 
   POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?, conservar_fabrica?,
                         conceptos?}
                       → redacción, estampado, verificación de salida y subida del PDF (PUT a salida_url)
-                        marca = {logo?: PNG/JPEG en base64, datos?: [líneas], pie?: [líneas]}; necesita
-                        que la plantilla defina sus zonas ("marca")
+                        marca = {logo?: PNG/JPEG en base64, datos?: [líneas], pie?: [líneas], condiciones?: texto};
+                        logo, datos y pie necesitan que la plantilla defina sus zonas ("marca"); condiciones
+                        sustituye el texto de condiciones de la fábrica si la plantilla lo define y el PDF lo trae
 
 Respuestas 200 con "estado": "ok" | "needs_review". En needs_review no se sube nada.
 Importes en JSON como texto con punto decimal ("1300.00"); en la entrada también se aceptan números.
@@ -102,6 +103,7 @@ class PeticionMarca(BaseModel):
     logo: str | None = Field(default=None, max_length=(MAX_LOGO + 2) // 3 * 4)
     datos: list[Linea] = Field(default_factory=list, max_length=6)
     pie: list[Linea] = Field(default_factory=list, max_length=3)
+    condiciones: str | None = Field(default=None, max_length=4000)  # sustituye las condiciones de la fábrica
 
     def a_motor(self) -> motor.Marca:
         logo = None
@@ -110,7 +112,7 @@ class PeticionMarca(BaseModel):
                 logo = base64.b64decode(self.logo, validate=True)
             except ValueError as e:
                 raise ErrorPeticion(400, "marca.logo: base64 no válido") from e
-        return motor.Marca(logo, list(self.datos), list(self.pie))
+        return motor.Marca(logo, list(self.datos), list(self.pie), self.condiciones or None)
 
 
 class PeticionConcepto(BaseModel):

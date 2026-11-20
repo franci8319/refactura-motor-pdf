@@ -73,6 +73,7 @@ def main() -> int:
     ap.add_argument("--logo", type=Path, help="logo del montador (PNG o JPEG)")
     ap.add_argument("--dato", action="append", default=[], help="línea de datos del montador (repetible)")
     ap.add_argument("--pie", action="append", default=[], help="línea del pie del montador (repetible)")
+    ap.add_argument("--condiciones", type=Path, help="archivo de texto con las condiciones del montador")
     ap.add_argument("--concepto", action="append", default=[], metavar="TEXTO=IMPORTE",
                     help="línea añadida sin %% (repetible), p. ej. --concepto 'Portes=150'")
     ap.add_argument("--conservar-fabrica", action="store_true", help="deja el logo y el nombre de la fábrica")
@@ -86,7 +87,8 @@ def main() -> int:
     if args.montaje is not None and args.montaje < 0:
         ap.error("el montaje no puede ser negativo")
     pdfs = args.pdfs or sorted((ROOT / "samples").glob("*.pdf"))
-    marca = Marca(args.logo.read_bytes() if args.logo else None, args.dato, args.pie)
+    marca = Marca(args.logo.read_bytes() if args.logo else None, args.dato, args.pie,
+                  args.condiciones.read_text(encoding="utf-8") if args.condiciones else None)
     conceptos = []
     for c in args.concepto:
         texto, _, importe = c.rpartition("=")

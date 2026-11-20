@@ -125,3 +125,14 @@ def test_conceptos_en_plantilla_sin_conceptos_es_error_de_conceptos():
     T = motor.compile_template(EJEMPLO)
     bc, err = motor.plan_conceptos(b"", extraccion(False), T, [motor.Concepto("Portes", Decimal(1))])
     assert bc is None and err and all(e.startswith("conceptos:") for e in err)
+
+
+def test_envolver_parte_por_palabras_y_mantiene_lineas_vacias():
+    lineas = motor.envolver("uno dos tres cuatro\n\nfin", motor.FONT_REG.text_length("uno dos", fontsize=10) + 1, 10)
+    assert lineas == ["uno dos", "tres", "cuatro", "", "fin"]
+
+
+def test_limpiar_condiciones_quita_la_fabrica_salvo_si_se_conserva():
+    T = {"lista_negra": ["ACME", "ACME Solar"]}
+    assert motor.limpiar_condiciones("\n\nquedando acme solar  eximida\n\n", T, False) == "quedando eximida"
+    assert motor.limpiar_condiciones("quedando ACME eximida", T, True) == "quedando ACME eximida"

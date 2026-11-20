@@ -113,3 +113,39 @@ def test_conservando_logo_de_fabrica_el_del_montador_va_aparte(sample):
         return [i["bbox"] for i in doc[0].get_image_info() if fitz.Rect(i["bbox"]).intersects(zona)]
     assert imgs(salida, fab) == imgs(original, fab) != []  # el de fábrica, intacto
     assert len(imgs(salida, alt)) == 1  # el del montador, en su zona
+
+
+CONDICIONES = ("Le rogamos que revise medidas y cantidades.\nMuy importante, revisar mano de apertura.\n\n"
+               "Acepto el presupuesto\n\n\nSello/DNI, Firma y Fecha")
+
+
+def _plantilla_con_condiciones() -> dict:
+    p = next((t for t in reversed(PLANTILLAS) if "condiciones" in t), None)
+    if p is None:
+        pytest.skip("ninguna plantilla define condiciones")
+    return p
+
+
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_condiciones_del_montador_sustituyen_las_de_fabrica(sample):
+    plantilla = _plantilla_con_condiciones()
+    almacen = Almacen(sample.read_bytes())
+    nombre = plantilla["redaccion"]["lista_negra"][-1]  # un nombre de fábrica: se quita del texto del montador
+    d = generar(cliente(almacen), plantilla=plantilla,
+                marca={"condiciones": CONDICIONES + f"\nQuedando {nombre} eximida."}).json()
+    assert d["estado"] == "ok", d["errores"]
+    salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
+    ultima = " ".join(salida[-1].get_text().split())
+    assert "Muy importante, revisar mano de apertura." in ultima and "Quedando eximida." in ultima
+    original = " ".join(fitz.open(stream=sample.read_bytes(), filetype="pdf")[-1].get_text().split())
+    frase = "No se admitirán reclamaciones"
+    assert frase in original and frase not in ultima  # el texto de la fábrica ya no está
+
+
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_condiciones_demasiado_largas_son_error_de_marca(sample):
+    plantilla = _plantilla_con_condiciones()
+    almacen = Almacen(sample.read_bytes())
+    d = generar(cliente(almacen), plantilla=plantilla, marca={"condiciones": "\n".join(["Línea"] * 200)}).json()
+    assert d["estado"] == "needs_review" and not almacen.subidas
+    assert d["errores"] and all(e.startswith("marca:") for e in d["errores"])

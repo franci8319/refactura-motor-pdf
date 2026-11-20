@@ -317,3 +317,15 @@ def test_concepto_no_valido_400():
     almacen = Almacen()
     for c in ({"texto": "", "importe": "1"}, {"texto": "x", "importe": "-1"}, {"texto": "x", "importe": "1.234"}):
         assert generar(cliente(almacen), conceptos=[c]).status_code == 400
+
+
+@con_samples
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_condiciones_sin_pagina_de_condiciones_no_cambian_nada(sample):
+    """El formato sin texto de condiciones de la fábrica no añade nada aunque el montador tenga las suyas."""
+    almacen = Almacen(sample.read_bytes())
+    d = generar(cliente(almacen), marca={"condiciones": "Mis condiciones de prueba"}).json()
+    assert d["estado"] == "ok", d["errores"]
+    salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
+    assert salida.page_count == fitz.open(stream=sample.read_bytes(), filetype="pdf").page_count
+    assert "Mis condiciones de prueba" not in "".join(p.get_text() for p in salida)
