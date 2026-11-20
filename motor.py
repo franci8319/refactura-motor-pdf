@@ -1352,8 +1352,11 @@ def analizar(pdf: bytes, T: dict) -> Resultado:
 def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: Decimal | None = None,
             pct_lineas: dict[int, Decimal] | None = None, marca: Marca | None = None,
             conservar_fabrica: bool = False, conceptos: list[Concepto] | None = None,
-            iva_pct: Decimal | None = None) -> Resultado:
+            iva_pct: Decimal | None = None, diagnostico: bool = False) -> Resultado:
     """Analiza de nuevo (sin estado), calcula, redacta, estampa y verifica la salida.
+
+    diagnostico: solo para herramientas internas; con needs_review devuelve igualmente el PDF generado
+    (Resultado.ok sigue en False: el servicio no lo entrega nunca).
 
     conservar_fabrica: deja el logo y el nombre de la fábrica (los precios se eliminan siempre).
     conceptos: líneas añadidas por el montador (sin %), en un bloque encima de los totales."""
@@ -1392,7 +1395,7 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
     datos["estado"] = "needs_review" if errores else "ok"
     datos["errores"] = errores
     if errores:
-        return Resultado(datos)  # sin verificación no hay entrega
+        return Resultado(datos, salida if diagnostico else None)  # sin verificación no hay entrega
     return Resultado(datos, salida, miniaturas)
 
 
