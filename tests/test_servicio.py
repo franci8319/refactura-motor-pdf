@@ -315,7 +315,7 @@ def test_conceptos_imposibles_son_error_de_conceptos(caso):
 
 def test_concepto_no_valido_400():
     almacen = Almacen()
-    for c in ({"texto": "", "importe": "1"}, {"texto": "x", "importe": "-1"}, {"texto": "x", "importe": "1.234"}):
+    for c in ({"texto": "", "importe": "1"}, {"texto": "x", "importe": "-1000001"}, {"texto": "x", "importe": "1.234"}):
         assert generar(cliente(almacen), conceptos=[c]).status_code == 400
 
 
@@ -329,3 +329,18 @@ def test_condiciones_sin_pagina_de_condiciones_no_cambian_nada(sample):
     salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
     assert salida.page_count == fitz.open(stream=sample.read_bytes(), filetype="pdf").page_count
     assert "Mis condiciones de prueba" not in "".join(p.get_text() for p in salida)
+
+
+@con_samples
+def test_descuento_al_cliente_resta_y_no_puede_dejar_negativo():
+    if "conceptos" not in PLANTILLA:
+        pytest.skip("la plantilla no define conceptos")
+    almacen = Almacen(SAMPLES[0].read_bytes())
+    d = generar(cliente(almacen), conceptos=[{"texto": "Descuento", "importe": "-100.00"}]).json()
+    assert d["estado"] == "ok", d["errores"]
+    assert sum(Decimal(ln["total"]) for ln in d["lineas"]) - Decimal("100.00") == Decimal(d["totales"]["base"])
+    assert "-100,00 €" in " ".join("".join(p.get_text() for p in fitz.open(stream=almacen.subidas[0], filetype="pdf")).split())
+    almacen = Almacen(SAMPLES[0].read_bytes())
+    d = generar(cliente(almacen), conceptos=[{"texto": "Descuento", "importe": "-999999"}]).json()
+    assert d["estado"] == "needs_review" and not almacen.subidas
+    assert all(e.startswith("conceptos:") for e in d["errores"])

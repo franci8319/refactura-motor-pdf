@@ -639,7 +639,8 @@ def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> li
 
 @dataclass
 class Concepto:
-    """Línea que añade el montador (instalación, portes, retirada…): precio final, sin %."""
+    """Línea que añade el montador (instalación, portes, retirada… o un descuento al cliente, en negativo):
+    precio final, sin %."""
     texto: str
     importe: Decimal
 
@@ -1375,6 +1376,9 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
     miniaturas: list[bytes] = []
     if not errores:
         calc = calcular(ex, pct, modo, montaje, pct_lineas, conceptos, iva_pct)
+    if calc is not None and calc["base"] < 0:
+        errores, calc = ["conceptos: los descuentos dejan el presupuesto en negativo"], None
+    if calc is not None:
         salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica, bc, pc)
         with fitz.open(stream=pdf, filetype="pdf") as orig:
             texto_original = "\n".join(p.get_text() for p in orig)

@@ -116,10 +116,10 @@ class PeticionMarca(BaseModel):
 
 
 class PeticionConcepto(BaseModel):
-    """Línea añadida por el montador (instalación, portes…): precio final, sin %."""
+    """Línea añadida por el montador (instalación, portes… o un descuento al cliente, en negativo): sin %."""
     model_config = ConfigDict(extra="forbid")
     texto: str = Field(min_length=1, max_length=80)
-    importe: Decimal = Field(ge=0, le=1_000_000, decimal_places=2)
+    importe: Decimal = Field(ge=-1_000_000, le=1_000_000, decimal_places=2)
 
 
 class PeticionGenerar(PeticionAnalizar):
