@@ -33,9 +33,9 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
         sin_pos = raw.get("lineas_sin_pos", "otro")
         if sin_pos not in ("otro", "extra"):
             raise ValueError(f"lineas_sin_pos desconocido: {sin_pos!r}")
-        mn = raw.get("montaje_nuevo")
-        if mn is not None and mn["ancla"] not in ("Base Imponible", "Total", "IVA", "TOTAL"):
-            raise ValueError(f"montaje_nuevo.ancla desconocida: {mn['ancla']!r}")
+        con = raw.get("conceptos")
+        if con is not None and con["ancla"] not in ("Base Imponible", "Total", "IVA", "TOTAL"):
+            raise ValueError(f"conceptos.ancla desconocida: {con['ancla']!r}")
         pie_defecto = (marca or {}).get("pie_por_defecto")
         if pie_defecto not in (None, "datos"):
             raise ValueError(f"pie_por_defecto desconocido: {pie_defecto!r}")
@@ -50,10 +50,12 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             # Líneas con precio pero sin cabecera "Pos." (ni montaje): "otro" = sin decidir (needs_review);
             # "extra" = suplemento de fábrica (vidrio, perfil…): lleva el % como una ventana, sin dibujo.
             "lineas_sin_pos": sin_pos,
-            # Opcional: si el PDF no trae línea de instalación, dónde se añade la del montador, relativa
-            # a un total (borde derecho = el del total + dx; línea base = la del total + dy).
-            "montaje_nuevo": None if mn is None else {
-                "etiqueta": str(mn["etiqueta"]), "ancla": mn["ancla"], "dx": float(mn["dx"]), "dy": float(mn["dy"]),
+            # Opcional: líneas que añade el montador ("Otros conceptos": instalación, portes…) en un bloque
+            # encima del recuadro de totales, que baja para hacer sitio. "caja" = recuadro de totales relativo
+            # al ancla: [x0 − x1_ancla, y0 − y0_ancla, x1 − x1_ancla, y1 − y0_ancla].
+            "conceptos": None if con is None else {
+                "ancla": con["ancla"], "caja": tuple(float(v) for v in con["caja"]),
+                "margen_inferior": float(con["margen_inferior"]), "max_lineas": int(con.get("max_lineas", 10)),
             },
             "precio": re.compile(raw["precio"]),
             "totales": re.compile(raw["totales"]),
@@ -321,7 +323,7 @@ def validate_params(ex: Extraccion, montaje: Decimal | None, pct_lineas: dict[in
                     T: dict | None = None) -> list[str]:
     """Parámetros que solo se pueden comprobar contra las líneas extraídas."""
     err = []
-    if montaje is not None and not tiene_montaje(ex) and (T is None or T["montaje_nuevo"] is None):
+    if montaje is not None and not tiene_montaje(ex) and (T is None or T["conceptos"] is None):
         err.append("se indicó montaje pero el PDF no tiene línea de instalación donde escribirlo")
     for i in sorted(pct_lineas):
         if not 0 <= i < len(ex.lineas):
@@ -419,42 +421,124 @@ def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> li
 
 
 @dataclass
-class MontajeNuevo:
-    """Línea de instalación que se añade cuando el PDF no la trae (precio del montador, sin %)."""
-    pagina: int
+class Concepto:
+    """Línea que añade el montador (instalación, portes, retirada…): precio final, sin %."""
     texto: str
-    x1: float
-    y: float
+    importe: Decimal
+
+
+TITULO_CONCEPTOS = "Otros conceptos"
+PAD_CONCEPTOS = 5.0  # pt de margen interior arriba y abajo del bloque
+INTERLINEA_CONCEPTOS = 1.6  # paso entre filas, en veces el tamaño de letra de los totales
+HUECO_CONCEPTOS = 6.0  # pt entre el bloque nuevo y el recuadro de totales
+SANGRIA = 12.0  # pt desde el borde izquierdo del recuadro
+
+
+@dataclass
+class BloqueConceptos:
+    """Dónde va cada cosa al añadir conceptos: el bloque nuevo ocupa el sitio del recuadro de totales y
+    este baja `desplazamiento` pt (redibujado igual, con los totales en las mismas posiciones relativas)."""
+    pagina: int
+    caja: fitz.Rect  # recuadro de totales original
+    bloque: fitz.Rect  # recuadro nuevo de conceptos
+    desplazamiento: float
     size: float
-    color: int
+    color: int  # del texto (el de los totales)
+    trazo: tuple
+    ancho_trazo: float
+    x_importe: float  # borde derecho de importes (el de los totales)
+    y_titulo: float
+    filas: list[tuple[str, str, float]]  # texto, importe "1.234,56 €", línea base
 
     @property
-    def rect(self) -> fitz.Rect:
-        w = FONT.text_length(self.texto, fontsize=self.size)
-        return fitz.Rect(self.x1 - w, self.y - self.size, self.x1, self.y + self.size * 0.25)
+    def caja_nueva(self) -> fitz.Rect:
+        return self.caja + (0, self.desplazamiento, 0, self.desplazamiento)
 
 
-def montaje_nuevo(ex: Extraccion, T: dict, importe: Decimal | None) -> MontajeNuevo | None:
-    """Dónde y cómo se escribe la instalación añadida; None si no toca (sin importe o el PDF ya la trae)."""
-    M = T["montaje_nuevo"]
-    if importe is None or tiene_montaje(ex) or M is None:
-        return None
-    ancla = get_total(ex, M["ancla"])
-    if ancla is None:
-        return None
-    return MontajeNuevo(ancla.pagina, f"{M['etiqueta']}: {fmt_eur(importe)} €",
-                        ancla.rect[2] + M["dx"], ancla.origin[1] + M["dy"], ancla.size, ancla.color)
+def _parecido(a: fitz.Rect, b: fitz.Rect, tol: float = 3) -> bool:
+    return all(abs(x - y) <= tol for x, y in zip(a, b))
 
 
-def validate_hueco(pdf: bytes, mn: MontajeNuevo) -> list[str]:
-    """La instalación añadida solo se escribe en un hueco vacío del PDF original (ni texto ni imágenes)."""
+def plan_conceptos(pdf: bytes, ex: Extraccion, T: dict, conceptos: list[Concepto]
+                   ) -> tuple[BloqueConceptos | None, list[str]]:
+    """Comprueba que los conceptos caben y calcula su sitio. Los errores llevan el prefijo "conceptos:":
+    son de lo que pide el montador (demasiadas líneas, texto largo), no del PDF."""
+    if not conceptos:
+        return None, []
+    C = T["conceptos"]
+    if C is None:
+        return None, ["conceptos: este formato de presupuesto no admite líneas añadidas"]
+    if len(conceptos) > C["max_lineas"]:
+        return None, [f"conceptos: como mucho {C['max_lineas']} líneas añadidas"]
+    ancla = get_total(ex, C["ancla"])
+    if ancla is None or any(t.pagina != ancla.pagina for t in ex.totales):
+        return None, ["conceptos: los totales no están juntos en una página"]
+    c0, c1, c2, c3 = C["caja"]
+    caja = fitz.Rect(ancla.rect[2] + c0, ancla.rect[1] + c1, ancla.rect[2] + c2, ancla.rect[1] + c3)
+    size = ancla.size
+    paso = size * INTERLINEA_CONCEPTOS
+    bloque = fitz.Rect(caja.x0, caja.y0, caja.x1, caja.y0 + 2 * PAD_CONCEPTOS + paso * (len(conceptos) + 1))
+    desplazamiento = bloque.height + HUECO_CONCEPTOS
+    x_importe = ancla.rect[2]
+    y_titulo = bloque.y0 + PAD_CONCEPTOS + size * 1.1
+    filas = [(c.texto, f"{fmt_eur(c.importe)} €", y_titulo + paso * (i + 1)) for i, c in enumerate(conceptos)]
+
+    err = []
+    for texto, importe, _ in filas:
+        raros = sorted({ch for ch in texto if not FONT.has_glyph(ord(ch))})
+        hueco = (x_importe - FONT.text_length(importe, fontsize=size) - 16) - (caja.x0 + SANGRIA * 2)
+        if not texto.strip():
+            err.append("conceptos: hay una línea sin texto")
+        elif raros:
+            err.append(f"conceptos: «{texto[:30]}» lleva caracteres no admitidos {raros}")
+        elif FONT.text_length(texto, fontsize=size) > hueco:
+            err.append(f"conceptos: «{texto[:30]}…» es demasiado largo; acórtalo")
+    if err:
+        return None, err
+
     with fitz.open(stream=pdf, filetype="pdf") as doc:
-        page = doc[mn.pagina]
-        r = pad(tuple(mn.rect), 1)
-        if not page.rect.contains(r) or page.get_text(clip=r).strip() or \
-                any(fitz.Rect(i["bbox"]).intersects(r) for i in page.get_image_info()):
-            return ["no hay hueco libre en el PDF para añadir la línea de instalación"]
-    return []
+        page = doc[ancla.pagina]
+        dibujos = page.get_drawings()
+        recuadro = next((d for d in dibujos if _parecido(d["rect"], caja)), None)
+        if recuadro is None:
+            return None, ["conceptos: no se encuentra el recuadro de totales en el PDF"]
+        # En el recuadro solo pueden estar los totales: se vacía entero y se redibuja más abajo.
+        totales = [t for t in ex.totales if t.pagina == ancla.pagina]
+        def lineas(texto: str) -> list[str]:
+            return sorted(_normal(l) for l in texto.splitlines() if l.strip())
+        if not all(pad(tuple(caja), 1).contains(fitz.Rect(t.rect)) for t in totales) or \
+                lineas(page.get_text(clip=caja)) != lineas("\n".join(
+                    page.get_text(clip=fitz.Rect(t.rect)) for t in totales)):
+            return None, ["conceptos: el recuadro de totales tiene algo más que los totales"]
+        fondo = caja.y1 + desplazamiento
+        libre = fitz.Rect(caja.x0 - 1, caja.y1 + 1, caja.x1 + 1, fondo + 1)
+        ocupado = page.get_text(clip=libre).strip() or \
+            any(fitz.Rect(i["bbox"]).intersects(libre) for i in page.get_image_info()) or \
+            any(fitz.Rect(d["rect"]).intersects(libre) for d in dibujos if d is not recuadro)
+        if fondo > page.rect.height - C["margen_inferior"] or ocupado:
+            return None, [f"conceptos: no caben {len(conceptos)} líneas añadidas en la página de los totales; "
+                          "quita alguna o júntalas"]
+    trazo = recuadro.get("color") or (0, 0, 0)
+    return BloqueConceptos(ancla.pagina, caja, bloque, desplazamiento, size, ancla.color, tuple(trazo),
+                           recuadro.get("width") or 1.0, x_importe, y_titulo, filas), []
+
+
+def stamp_conceptos(page: fitz.Page, b: BloqueConceptos) -> None:
+    """Vacía el recuadro de totales (trazos incluidos), dibuja el bloque de conceptos y el recuadro movido.
+    Los totales se estampan aparte, desplazados."""
+    page.add_redact_annot(pad(tuple(b.caja), 2), fill=False)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                          graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                          text=fitz.PDF_REDACT_TEXT_REMOVE)
+    page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
+    for r in (b.bloque, b.caja_nueva):
+        page.draw_rect(r, color=b.trazo, width=b.ancho_trazo)
+    rgb = tuple(((b.color >> s) & 0xFF) / 255 for s in (16, 8, 0))
+    page.insert_text((b.caja.x0 + SANGRIA, b.y_titulo), TITULO_CONCEPTOS, fontname=FONT_NAME,
+                     fontsize=b.size, color=rgb)
+    for texto, importe, y in b.filas:
+        page.insert_text((b.caja.x0 + SANGRIA * 2, y), texto, fontname=FONT_NAME, fontsize=b.size, color=rgb)
+        stamp_right(page, importe, b.x_importe, y, b.size, b.color)
 
 
 def pie_de_datos(datos: list[str], zona: tuple) -> list[str]:
@@ -481,10 +565,10 @@ def precio_cliente(coste: Decimal, pct: Decimal, modo: str) -> Decimal:
 
 
 def calcular(ex: Extraccion, pct: Decimal, modo: str, montaje: Decimal | None,
-             pct_lineas: dict[int, Decimal]) -> dict:
+             pct_lineas: dict[int, Decimal], conceptos: list[Concepto] | None = None) -> dict:
     """Ventanas: coste de fábrica + % (global o de la línea). Montaje: precio del montador, sin %.
 
-    Si el PDF no trae línea de instalación, el montaje indicado se suma aparte (montaje_nuevo)."""
+    Conceptos añadidos por el montador: precio final, sin %, suman a la base."""
     lineas = []
     for i, ln in enumerate(ex.lineas):
         if ln.tipo == "montaje":
@@ -495,12 +579,13 @@ def calcular(ex: Extraccion, pct: Decimal, modo: str, montaje: Decimal | None,
             unit = precio_cliente(parse_eur(ln.importe), p, modo)
         lineas.append({"ref": ln.ref, "tipo": ln.tipo, "uds": ln.uds, "pct": p,
                        "importe": unit, "total": unit * ln.uds})
-    nuevo = montaje if montaje is not None and not tiene_montaje(ex) else None
-    base = sum((l["total"] for l in lineas), Decimal(0)) + (nuevo or 0)
+    conceptos = conceptos or []
+    extra = sum((c.importe for c in conceptos), Decimal(0))
+    base = sum((l["total"] for l in lineas), Decimal(0)) + extra
     iva_pct = parse_pct(get_total(ex, "IVA").iva_pct)
     iva = (base * iva_pct / 100).quantize(CENT, ROUND_HALF_UP)
-    return {"lineas": lineas, "montaje_nuevo": nuevo, "base": base, "iva_pct": iva_pct, "iva": iva,
-            "total": base + iva}
+    return {"lineas": lineas, "conceptos": [{"texto": c.texto, "importe": c.importe} for c in conceptos],
+            "extra": extra, "base": base, "iva_pct": iva_pct, "iva": iva, "total": base + iva}
 
 
 def stamp_right(page: fitz.Page, text: str, x1: float, y: float, size: float, color: int) -> None:
@@ -545,7 +630,7 @@ def zonas_marca(marca: Marca | None, T: dict, n: int) -> list[tuple]:
 
 
 def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Marca | None = None,
-                     conservar_fabrica: bool = False, mn: MontajeNuevo | None = None) -> bytes:
+                     conservar_fabrica: bool = False, bc: BloqueConceptos | None = None) -> bytes:
     doc = fitz.open(stream=pdf, filetype="pdf")
     labels = {"Base Imponible": "Base Imponible", "Total": "Total", "TOTAL": "TOTAL"}
     for page in doc:
@@ -571,6 +656,10 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
                               graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                               text=fitz.PDF_REDACT_TEXT_REMOVE)
         page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
+        dy = 0.0
+        if bc is not None and bc.pagina == n:
+            stamp_conceptos(page, bc)
+            dy = bc.desplazamiento
 
         for ln, nuevo in zip(ex.lineas, calc["lineas"]):
             if ln.pagina != n:
@@ -583,9 +672,7 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
             else:
                 valor = calc["total"] if t.label == "TOTAL" else calc["base"]
                 txt = f"{labels[t.label]}: {fmt_eur(valor)} €"
-            stamp_right(page, txt, t.rect[2], t.origin[1], t.size, t.color)
-        if mn is not None and mn.pagina == n:
-            stamp_right(page, mn.texto, mn.x1, mn.y, mn.size, mn.color)
+            stamp_right(page, txt, t.rect[2], t.origin[1] + dy, t.size, t.color)
 
         if marca is not None and not marca.vacia:
             M = T["marca"]
@@ -673,7 +760,7 @@ def verify_zonas_fabrica(doc: fitz.Document, T: dict, marca: Marca | None) -> li
 
 
 def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | None = None,
-           conservar_fabrica: bool = False, mn: MontajeNuevo | None = None) -> tuple[list[str], list[bytes]]:
+           conservar_fabrica: bool = False, bc: BloqueConceptos | None = None) -> tuple[list[str], list[bytes]]:
     """Verificación de salida obligatoria (sección 'Redacción real y verificación de salida').
 
     Devuelve los errores y una miniatura PNG por página para la pantalla de descarga.
@@ -681,10 +768,16 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | N
     err = []
     doc = fitz.open(stream=pdf, filetype="pdf")
     texto = "\n".join(p.get_text() for p in doc)
-    if mn is not None:
-        if _normal(mn.texto) not in _normal(doc[mn.pagina].get_text()):
-            err.append("línea de instalación añadida no estampada")
-        texto = texto.replace(mn.texto, "")  # precio del montador: puede coincidir con uno de fábrica
+    if bc is not None:
+        pagina = doc[bc.pagina]
+        en_bloque = _normal(pagina.get_text(clip=bc.bloque))
+        for linea in [TITULO_CONCEPTOS] + [t for f in bc.filas for t in f[:2]]:
+            if _normal(linea) not in en_bloque:
+                err.append("conceptos añadidos no estampados")
+                break
+        # Los importes del montador pueden coincidir con un precio de fábrica: fuera del bloque se buscan.
+        texto = "\n".join(p.get_text() if p.number != bc.pagina else " ".join(
+            w[4] for w in p.get_text("words") if not fitz.Rect(w[:4]).intersects(bc.bloque)) for p in doc)
 
     # El montaje es precio del montador, no de fábrica: puede seguir apareciendo.
     fabrica = [ln for ln in src_ex.lineas if ln.tipo != "montaje"]
@@ -729,7 +822,7 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | N
         t = get_total(out_ex, label)
         if not t or (parse_eur(t.valor) - exp).copy_abs() > TOL:
             err.append(f"total '{label}' estampado {t.valor if t else '—'} ≠ {fmt_eur(exp)}")
-    suma = sum((parse_eur(l.total) for l in out_ex.lineas), Decimal(0)) + (calc["montaje_nuevo"] or 0)
+    suma = sum((parse_eur(l.total) for l in out_ex.lineas), Decimal(0)) + calc["extra"]
     if (suma - calc["base"]).copy_abs() > TOL:
         err.append("suma de líneas estampadas ≠ base estampada")
     if out_ex.n_dibujos != src_ex.n_dibujos:
@@ -806,40 +899,43 @@ def analizar(pdf: bytes, T: dict) -> Resultado:
     datos = {"plantilla": T["id"], "estado": "needs_review" if errores else "ok", "errores": errores,
              "n_dibujos": ex.n_dibujos, "lineas": _lineas_publicas(ex, None),
              "totales_fabrica": _totales_fabrica(ex) if not errores else None,
-             # Sin línea de instalación en el PDF pero la plantilla sabe dónde añadirla: la app pide el montaje.
-             "montaje_nuevo": not errores and not tiene_montaje(ex) and T["montaje_nuevo"] is not None}
+             # La plantilla sabe dónde añadir conceptos del montador (instalación, portes…).
+             "admite_conceptos": T["conceptos"] is not None}
     return Resultado(datos, dibujos=[] if errores else recortar_dibujos(pdf, ex))
 
 
 def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: Decimal | None = None,
             pct_lineas: dict[int, Decimal] | None = None, marca: Marca | None = None,
-            conservar_fabrica: bool = False) -> Resultado:
+            conservar_fabrica: bool = False, conceptos: list[Concepto] | None = None) -> Resultado:
     """Analiza de nuevo (sin estado), calcula, redacta, estampa y verifica la salida.
 
-    conservar_fabrica: deja el logo y el nombre de la fábrica (los precios se eliminan siempre)."""
+    conservar_fabrica: deja el logo y el nombre de la fábrica (los precios se eliminan siempre).
+    conceptos: líneas añadidas por el montador (sin %), en un bloque encima de los totales."""
     pct_lineas = pct_lineas or {}
+    conceptos = list(conceptos or [])
     T = plantilla_efectiva(T, conservar_fabrica)
     marca = marca_efectiva(marca or Marca(), T, conservar_fabrica)
     ex, errores = _analisis(pdf, T)
-    mn = None
+    bc = None
+    if not errores and montaje is not None and not tiene_montaje(ex) and T["conceptos"] is not None:
+        # Compatibilidad: montaje sin línea en el PDF = concepto "Instalación".
+        conceptos, montaje = [Concepto("Instalación", montaje), *conceptos], None
     if not errores:
         errores = validate_params(ex, montaje, pct_lineas, T) + validate_marca(marca, T, conservar_fabrica)
     if not errores:
-        mn = montaje_nuevo(ex, T, montaje)
-        if mn is not None:
-            errores = validate_hueco(pdf, mn)
+        bc, errores = plan_conceptos(pdf, ex, T, conceptos)
     datos = {"plantilla": T["id"], "pct": pct, "modo": modo, "montaje": montaje,
              "pct_lineas": {str(k): v for k, v in sorted(pct_lineas.items())},
              "marca": not marca.vacia, "conservar_fabrica": conservar_fabrica, "n_dibujos": ex.n_dibujos}
     calc = salida = None
     miniaturas: list[bytes] = []
     if not errores:
-        calc = calcular(ex, pct, modo, montaje, pct_lineas)
-        salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica, mn)
-        errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica, mn)
+        calc = calcular(ex, pct, modo, montaje, pct_lineas, conceptos)
+        salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica, bc)
+        errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica, bc)
     datos["lineas"] = _lineas_publicas(ex, calc)
     datos["totales"] = {k: calc[k] for k in ("base", "iva_pct", "iva", "total")} if calc else None
-    datos["montaje_nuevo"] = calc["montaje_nuevo"] if calc else None
+    datos["conceptos"] = calc["conceptos"] if calc else [{"texto": c.texto, "importe": c.importe} for c in conceptos]
     datos["estado"] = "needs_review" if errores else "ok"
     datos["errores"] = errores
     if errores:

@@ -274,3 +274,46 @@ def test_conservar_fabrica_con_datos_es_error_de_marca():
     d = generar(cliente(almacen), conservar_fabrica=True, marca=MARCA).json()
     assert d["estado"] == "needs_review" and not almacen.subidas
     assert d["errores"] and all(e.startswith("marca:") for e in d["errores"])
+
+
+CONCEPTOS = [{"texto": "Retirada de ventanas antiguas", "importe": "600.00"}, {"texto": "Portes", "importe": "150"}]
+
+
+@con_samples
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_conceptos_anadidos(sample):
+    if "conceptos" not in PLANTILLA:
+        pytest.skip("la plantilla no define conceptos")
+    almacen = Almacen(sample.read_bytes())
+    d = generar(cliente(almacen), montaje="400", conceptos=CONCEPTOS).json()
+    assert d["estado"] == "ok", d["errores"]
+    assert sum(Decimal(ln["total"]) for ln in d["lineas"]) + Decimal("750.00") == Decimal(d["totales"]["base"])
+    salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
+    texto = " ".join("".join(p.get_text() for p in salida).split())
+    assert all(c["texto"] in texto for c in CONCEPTOS) and "600,00 €" in texto
+
+
+@con_samples
+@pytest.mark.parametrize("caso", ["demasiadas", "no_caben", "largo"])
+def test_conceptos_imposibles_son_error_de_conceptos(caso):
+    if "conceptos" not in PLANTILLA:
+        pytest.skip("la plantilla no define conceptos")
+    conceptos = {"demasiadas": [{"texto": f"C{i}", "importe": "1"} for i in range(11)],
+                 "no_caben": [{"texto": f"C{i}", "importe": "1"} for i in range(10)],
+                 "largo": [{"texto": "M" * 75, "importe": "1"}]}[caso]
+    # "no_caben": alguna muestra tiene poco hueco bajo los totales; en esa no caben 10 líneas.
+    fallos = []
+    for sample in SAMPLES:
+        almacen = Almacen(sample.read_bytes())
+        d = generar(cliente(almacen), conceptos=conceptos).json()
+        if d["estado"] == "needs_review":
+            assert not almacen.subidas
+            assert d["errores"] and all(e.startswith("conceptos:") for e in d["errores"]), d["errores"]
+            fallos.append(sample)
+    assert fallos if caso == "no_caben" else len(fallos) == len(SAMPLES)
+
+
+def test_concepto_no_valido_400():
+    almacen = Almacen()
+    for c in ({"texto": "", "importe": "1"}, {"texto": "x", "importe": "-1"}, {"texto": "x", "importe": "1.234"}):
+        assert generar(cliente(almacen), conceptos=[c]).status_code == 400

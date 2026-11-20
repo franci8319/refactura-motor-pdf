@@ -7,7 +7,8 @@ el worker lo descarga de una URL firmada del bucket temporal y sube el generado 
   POST /v1/analizar   {pdf_url, plantilla}
                       → huella, extracción y validación (lo que el montador revisa); cada línea
                         lleva "dibujo_png" (PNG en base64 del dibujo de la ventana, o null)
-  POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?, conservar_fabrica?}
+  POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?, conservar_fabrica?,
+                        conceptos?}
                       → redacción, estampado, verificación de salida y subida del PDF (PUT a salida_url)
                         marca = {logo?: PNG/JPEG en base64, datos?: [líneas], pie?: [líneas]}; necesita
                         que la plantilla defina sus zonas ("marca")
@@ -112,6 +113,13 @@ class PeticionMarca(BaseModel):
         return motor.Marca(logo, list(self.datos), list(self.pie))
 
 
+class PeticionConcepto(BaseModel):
+    """Línea añadida por el montador (instalación, portes…): precio final, sin %."""
+    model_config = ConfigDict(extra="forbid")
+    texto: str = Field(min_length=1, max_length=80)
+    importe: Decimal = Field(ge=0, le=1_000_000, decimal_places=2)
+
+
 class PeticionGenerar(PeticionAnalizar):
     salida_url: str
     pct: Pct
@@ -120,6 +128,7 @@ class PeticionGenerar(PeticionAnalizar):
     pct_lineas: dict[int, Pct] = Field(default_factory=dict)
     marca: PeticionMarca | None = None
     conservar_fabrica: bool = False  # deja el logo y el nombre de la fábrica; los precios se eliminan siempre
+    conceptos: list[PeticionConcepto] = Field(default_factory=list, max_length=20)  # la plantilla fija el máximo
 
     @model_validator(mode="after")
     def _pcts(self) -> PeticionGenerar:
@@ -215,8 +224,9 @@ def crear_app(cfg: Config | None = None, transporte: httpx.BaseTransport | None 
         _comprobar_url(p.salida_url, cfg, "salida_url")
         marca = p.marca.a_motor() if p.marca else None
         pdf = _descargar(cliente, p.pdf_url, cfg)
+        conceptos = [motor.Concepto(c.texto.strip(), c.importe) for c in p.conceptos]
         r = _con_motor(motor.generar, pdf, T, p.pct, p.modo, p.montaje, p.pct_lineas, marca,
-                       p.conservar_fabrica)
+                       p.conservar_fabrica, conceptos)
         if not r.ok:
             return {**r.datos, "entregado": False}
         _subir(cliente, p.salida_url, r.pdf)

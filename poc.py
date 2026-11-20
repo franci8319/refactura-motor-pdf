@@ -28,7 +28,7 @@ import sys
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
-from motor import CENT, Marca, compile_template, fmt_eur, generar, jsonable, parse_pct
+from motor import CENT, Concepto, Marca, compile_template, fmt_eur, generar, jsonable, parse_pct
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = Path(__file__).resolve().parent / "out"
@@ -43,13 +43,14 @@ def load_template(path: Path) -> dict:
 
 
 def process(src: Path, pct: Decimal, modo: str, montaje: Decimal | None, T: dict, marca: Marca,
-            conservar_fabrica: bool = False) -> dict:
+            conservar_fabrica: bool = False, conceptos: list[Concepto] | None = None) -> dict:
     out = OUT_DIR / src.stem
     out.mkdir(parents=True, exist_ok=True)
     # No dejar salida ni miniaturas viejas junto a un needs_review.
     for viejo in [out / "salida.pdf", *out.glob("p*.png")]:
         viejo.unlink(missing_ok=True)
-    r = generar(src.read_bytes(), T, pct, modo, montaje, marca=marca, conservar_fabrica=conservar_fabrica)
+    r = generar(src.read_bytes(), T, pct, modo, montaje, marca=marca, conservar_fabrica=conservar_fabrica,
+                conceptos=conceptos)
     if r.ok:
         (out / "salida.pdf").write_bytes(r.pdf)
         for i, png in enumerate(r.miniaturas, 1):
@@ -72,6 +73,8 @@ def main() -> int:
     ap.add_argument("--logo", type=Path, help="logo del montador (PNG o JPEG)")
     ap.add_argument("--dato", action="append", default=[], help="línea de datos del montador (repetible)")
     ap.add_argument("--pie", action="append", default=[], help="línea del pie del montador (repetible)")
+    ap.add_argument("--concepto", action="append", default=[], metavar="TEXTO=IMPORTE",
+                    help="línea añadida sin %% (repetible), p. ej. --concepto 'Portes=150'")
     ap.add_argument("--conservar-fabrica", action="store_true", help="deja el logo y el nombre de la fábrica")
     args = ap.parse_args()
     try:
@@ -84,10 +87,16 @@ def main() -> int:
         ap.error("el montaje no puede ser negativo")
     pdfs = args.pdfs or sorted((ROOT / "samples").glob("*.pdf"))
     marca = Marca(args.logo.read_bytes() if args.logo else None, args.dato, args.pie)
+    conceptos = []
+    for c in args.concepto:
+        texto, _, importe = c.rpartition("=")
+        if not texto or not importe:
+            ap.error(f"--concepto {c!r}: usa TEXTO=IMPORTE")
+        conceptos.append(Concepto(texto.strip(), parse_pct(importe).quantize(CENT, ROUND_HALF_UP)))
 
     fallos = 0
     for src in pdfs:
-        r = process(src, args.pct, args.modo, args.montaje, T, marca, args.conservar_fabrica)
+        r = process(src, args.pct, args.modo, args.montaje, T, marca, args.conservar_fabrica, conceptos)
         print(f"\n== {src.name}: {r['estado'].upper()} ({len(r['lineas'])} líneas, {r['n_dibujos']} dibujos)")
         for ln in r["lineas"]:
             extra = f" -> {fmt_eur(ln['total'])}" if "total" in ln else ""

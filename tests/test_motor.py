@@ -100,20 +100,28 @@ def test_pie_de_datos_largo_en_dos_lineas():
     assert len(lineas) == 2 and " · ".join(lineas) == " · ".join(datos)
 
 
-def test_montaje_nuevo_suma_a_la_base_sin_pct():
+def test_conceptos_suman_a_la_base_sin_pct():
     ex = extraccion(False)
-    calc = motor.calcular(ex, Decimal(30), "markup", Decimal("400.00"), {})
-    assert calc["montaje_nuevo"] == Decimal("400.00")
-    assert calc["base"] == Decimal("130.00") + Decimal("65.00") + Decimal("400.00")
+    conceptos = [motor.Concepto("Instalación", Decimal("400.00")), motor.Concepto("Portes", Decimal("50.00"))]
+    calc = motor.calcular(ex, Decimal(30), "markup", None, {}, conceptos)
+    assert calc["extra"] == Decimal("450.00")
+    assert calc["base"] == Decimal("130.00") + Decimal("65.00") + Decimal("450.00")
+    assert calc["conceptos"][0] == {"texto": "Instalación", "importe": Decimal("400.00")}
 
 
-def test_montaje_con_linea_en_el_pdf_no_se_anade():
+def test_montaje_con_linea_en_el_pdf_se_escribe_en_ella():
     ex = extraccion(False)
     ex.lineas.append(linea("montaje", "300,00"))
     calc = motor.calcular(ex, Decimal(30), "markup", Decimal("400.00"), {})
-    assert calc["montaje_nuevo"] is None and calc["lineas"][-1]["importe"] == Decimal("400.00")
+    assert calc["extra"] == 0 and calc["lineas"][-1]["importe"] == Decimal("400.00")
 
 
-def test_montaje_sin_linea_ni_hueco_es_error():
+def test_montaje_sin_linea_ni_conceptos_es_error():
     T = motor.compile_template(EJEMPLO)
     assert motor.validate_params(extraccion(False), Decimal(400), {}, T)
+
+
+def test_conceptos_en_plantilla_sin_conceptos_es_error_de_conceptos():
+    T = motor.compile_template(EJEMPLO)
+    bc, err = motor.plan_conceptos(b"", extraccion(False), T, [motor.Concepto("Portes", Decimal(1))])
+    assert bc is None and err and all(e.startswith("conceptos:") for e in err)

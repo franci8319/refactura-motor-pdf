@@ -82,20 +82,18 @@ def test_sin_marca_quita_logo_y_pie_de_fabrica(sample):
 
 
 @pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
-def test_montaje_nuevo_se_anade_y_suma(sample):
-    """Sin línea de instalación en el PDF, el montaje se escribe en el hueco de la plantilla y suma a la base."""
-    if "montaje_nuevo" not in PLANTILLA:
-        pytest.skip("la plantilla no define montaje_nuevo")
+def test_montaje_sin_linea_va_como_concepto_instalacion(sample):
+    """Este formato no trae instalación: el montaje se añade como primer concepto y suma a la base."""
     almacen = Almacen(sample.read_bytes())
-    d = generar(cliente(almacen), plantilla=PLANTILLA, pct=38, montaje="4000.00").json()
+    d = generar(cliente(almacen), plantilla=PLANTILLA, pct=38, montaje="4000.00",
+                conceptos=[{"texto": "Portes", "importe": "150"}]).json()
     assert d["estado"] == "ok", d["errores"]
-    assert d["montaje_nuevo"] == "4000.00"
-    assert not any(ln["tipo"] == "montaje" for ln in d["lineas"])
+    assert [c["texto"] for c in d["conceptos"]] == ["Instalación", "Portes"]
     lineas = sum(Decimal(ln["total"]) for ln in d["lineas"])
-    assert lineas + Decimal("4000.00") == Decimal(d["totales"]["base"])
+    assert lineas + Decimal("4150.00") == Decimal(d["totales"]["base"])
     salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
     texto = " ".join("".join(p.get_text() for p in salida).split())
-    assert f"{PLANTILLA['montaje_nuevo']['etiqueta']}: 4.000,00 €" in texto
+    assert "Otros conceptos" in texto and "4.000,00 €" in texto and "150,00 €" in texto
 
 
 @pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
