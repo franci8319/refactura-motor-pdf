@@ -136,3 +136,22 @@ def test_limpiar_condiciones_quita_la_fabrica_salvo_si_se_conserva():
     T = {"lista_negra": ["ACME", "ACME Solar"]}
     assert motor.limpiar_condiciones("\n\nquedando acme solar  eximida\n\n", T, False) == "quedando eximida"
     assert motor.limpiar_condiciones("quedando ACME eximida", T, True) == "quedando ACME eximida"
+
+
+def test_subtotales_esperados_por_pagina():
+    ex = motor.Extraccion(lineas=[linea("extra", "10,00"), linea("extra", "5,00")])
+    ex.lineas[1].pagina = 1
+    r = (0, 0, 1, 1)
+    ex.subtotales = [motor.Subtotal(0, "sigue", "10,00", r, (0, 0), 9, 0),
+                     motor.Subtotal(1, "anterior", "10,00", r, (0, 0), 9, 0)]
+    assert motor.subtotales_esperados(ex, [Decimal(10), Decimal(5)]) == [Decimal(10), Decimal(10)]
+    assert motor.validate_subtotales(ex, [Decimal(10), Decimal(5)]) == []
+    ex.subtotales[0].valor = "11,00"
+    assert motor.validate_subtotales(ex, [Decimal(10), Decimal(5)])
+
+
+def test_plantilla_modo_desconocido():
+    raw = copy.deepcopy(EJEMPLO)
+    raw["modo"] = "otro"
+    with pytest.raises(ValueError):
+        motor.compile_template(raw)

@@ -29,7 +29,10 @@ FONT_REG_NAME = "MontReg"
 def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
     """Valida el JSON de plantilla y compila sus regex. Falla pronto si falta una clave."""
     try:
-        a, red, dib = raw["anclas"], raw["redaccion"], raw["dibujo"]
+        modo = raw.get("modo", "uds")
+        if modo not in ("uds", "tabla"):
+            raise ValueError(f"modo desconocido: {modo!r}")
+        red = raw["redaccion"]
         logo = red["zona_logo_fabrica"]
         marca = raw.get("marca")
         sin_pos = raw.get("lineas_sin_pos", "otro")
@@ -42,35 +45,62 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
         pie_defecto = (marca or {}).get("pie_por_defecto")
         if pie_defecto not in (None, "datos"):
             raise ValueError(f"pie_por_defecto desconocido: {pie_defecto!r}")
-        return {
+        T = {"modo": modo}
+        if modo == "uds":
+            a, dib = raw["anclas"], raw["dibujo"]
+            T |= {
+                "ancla_linea": re.compile(a["linea"]),
+                "ancla_pos": re.compile(a["pos"]),
+                "ancla_montaje": re.compile(a["montaje"], re.I),
+                "ancla_importe": a["col_importe"],
+                "ancla_total_col": a["col_total"],
+                "totales": re.compile(raw["totales"]),
+                # Dibujo de ventana: imagen que empieza justo bajo la cabecera "Pos." y a la izquierda.
+                "dibujo_max_dy": dib["max_dy"],
+                "dibujo_max_x0": dib["max_x0"],
+            }
+        else:
+            t, tc = raw["tabla"], raw["totales_columnas"]
+            T |= {
+                # Tabla de líneas: cada fila con precio en la columna del total; cantidad × precio = total.
+                "tabla": {
+                    "col_cantidad": t["col_cantidad"], "col_precio": t["col_precio"], "col_total": t["col_total"],
+                    "col_descripcion": t["col_descripcion"], "tol_x": float(t.get("tol_x", 20)),
+                    "fin": list(t["fin"]), "subtotales": dict(t.get("subtotales", {})),
+                    "tipo": t.get("tipo", "extra"), "alto_ref": float(t.get("alto_ref", 14)),
+                    # Opcional: la descripción acaba donde empieza esta columna; las de en medio
+                    # (unidades, medidas…) se añaden a la referencia entre paréntesis.
+                    "col_fin_descripcion": t.get("col_fin_descripcion"),
+                },
+                # Totales en columnas: valores bajo una fila de títulos. Rangos del borde derecho del valor,
+                # relativos al x0 del ancla (un título de esa fila).
+                "totales_columnas": {
+                    "ancla": tc["ancla"], "alto": float(tc.get("alto", 22)),
+                    "columnas": {k: tuple(float(v) for v in r) for k, r in tc["columnas"].items()},
+                    "iva_pct": tuple(float(v) for v in tc["iva_pct"]),
+                },
+                "pct": re.compile(raw.get("pct", r"^\s*(\d{1,2}(?:,\d{1,2})?)\s*$")),
+            }
+        return T | {
             "id": f"{raw['id']}-v{raw['version']}",
             "huella": raw["huella"],
-            "ancla_linea": re.compile(a["linea"]),
-            "ancla_pos": re.compile(a["pos"]),
-            "ancla_montaje": re.compile(a["montaje"], re.I),
-            "ancla_importe": a["col_importe"],
-            "ancla_total_col": a["col_total"],
             # Líneas con precio pero sin cabecera "Pos." (ni montaje): "otro" = sin decidir (needs_review);
             # "extra" = suplemento de fábrica (vidrio, perfil…): lleva el % como una ventana, sin dibujo.
             "lineas_sin_pos": sin_pos,
-            # Opcional: líneas que añade el montador ("Otros conceptos": instalación, portes…) en un bloque
-            # encima del recuadro de totales, que baja para hacer sitio. "caja" = recuadro de totales relativo
-            # al ancla: [x0 − x1_ancla, y0 − y0_ancla, x1 − x1_ancla, y1 − y0_ancla].
             # Opcional: texto de condiciones de la fábrica que el montador puede sustituir por el suyo.
             # "zona" relativa al ancla (texto que lo abre): [x0 − x0_ancla, y0 − y0_ancla, x1 − x0_ancla, y1 − y0_ancla].
             "condiciones": None if cond is None else {
                 "ancla": str(cond["ancla"]), "zona": tuple(float(v) for v in cond["zona"]),
                 "tam": tuple(float(v) for v in cond.get("tam", (6.6, 5.0))),
             },
+            # Opcional: líneas que añade el montador ("Otros conceptos": instalación, portes…) en un bloque
+            # encima del recuadro de totales, que baja para hacer sitio. "caja" = recuadro de totales relativo
+            # al ancla: [x0 − x1_ancla, y0 − y0_ancla, x1 − x1_ancla, y1 − y0_ancla].
             "conceptos": None if con is None else {
                 "ancla": con["ancla"], "caja": tuple(float(v) for v in con["caja"]),
                 "margen_inferior": float(con["margen_inferior"]), "max_lineas": int(con.get("max_lineas", 10)),
             },
             "precio": re.compile(raw["precio"]),
-            "totales": re.compile(raw["totales"]),
-            # Dibujo de ventana: imagen que empieza justo bajo la cabecera "Pos." y a la izquierda.
-            "dibujo_max_dy": dib["max_dy"],
-            "dibujo_max_x0": dib["max_x0"],
             "logo_pagina": logo["pagina"] - 1,
             "zona_logo_fabrica": tuple(logo["rect"]),  # x0, y0, x1, y1
             "lista_negra": red["lista_negra"],
@@ -90,6 +120,8 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
                 "zona_pie": tuple(marca["zona_pie"]["rect"]),
                 # "datos": sin pie propio, los datos de empresa van también en el pie.
                 "pie_por_defecto": pie_defecto,
+                # false: la cabecera de fábrica ocupa el hueco del logo; conservándola no cabe el del montador.
+                "logo_con_fabrica": bool(marca.get("logo_con_fabrica", True)),
             },
         }
     except (KeyError, TypeError, re.error) as e:
@@ -140,6 +172,10 @@ class Linea:
     size: float
     color: int
     dibujo: tuple | None = None
+    # Modo tabla: importe = total de la línea (uds = 1) y en la columna de precio va el precio por unidad
+    # de medida (metro, m²…), que se recalcula como total / cantidad.
+    cantidad: Decimal | None = None
+    precio: str | None = None
 
 
 @dataclass
@@ -152,6 +188,19 @@ class Total:
     origin: tuple
     size: float
     color: int
+    solo_valor: bool = False  # modo tabla: el valor va solo, bajo su título de columna
+
+
+@dataclass
+class Subtotal:
+    """Suma parcial entre páginas ("Suma y sigue" al pie, "Suma anterior" al principio de la siguiente)."""
+    pagina: int
+    tipo: str  # "sigue" | "anterior"
+    valor: str
+    rect: tuple
+    origin: tuple
+    size: float
+    color: int
 
 
 @dataclass
@@ -160,6 +209,7 @@ class Extraccion:
     totales: list[Total] = field(default_factory=list)
     n_dibujos: int = 0
     errores: list[str] = field(default_factory=list)
+    subtotales: list[Subtotal] = field(default_factory=list)
 
 
 @dataclass
@@ -232,6 +282,83 @@ def check_huella(doc: fitz.Document, T: dict) -> list[str]:
 
 
 def extract(doc: fitz.Document, T: dict) -> Extraccion:
+    return extract_tabla(doc, T) if T["modo"] == "tabla" else extract_uds(doc, T)
+
+
+def _misma_fila(a: Span, b: Span, tol: float = 2.5) -> bool:
+    return abs(a.bbox[1] - b.bbox[1]) <= tol
+
+
+def extract_tabla(doc: fitz.Document, T: dict) -> Extraccion:
+    """Presupuesto en tabla (sin dibujos): filas con precio en la columna del total, subtotales entre
+    páginas y totales en columnas bajo su fila de títulos."""
+    C, TC = T["tabla"], T["totales_columnas"]
+    ex = Extraccion()
+    for page in doc:
+        spans = page_spans(page)
+        cab = {k: next((s for s in spans if s.text.strip() == C[k]), None)
+               for k in ("col_cantidad", "col_precio", "col_total", "col_descripcion")}
+        fin_desc = C["col_fin_descripcion"] and next((s for s in spans if s.text.strip() == C["col_fin_descripcion"]), None)
+        etiquetas_sub = [(tipo, s) for s in spans for tipo, texto in C["subtotales"].items()
+                         if s.text.strip().startswith(texto)]
+        for tipo, et in etiquetas_sub:
+            v = next((s for s in spans if T["precio"].match(s.text) and _misma_fila(s, et, 3)
+                      and s.bbox[0] > et.bbox[2]), None)
+            if v is None:
+                ex.errores.append(f"p{page.number + 1}: subtotal sin importe")
+            else:
+                ex.subtotales.append(Subtotal(page.number, tipo, v.text.strip(), v.bbox, v.origin, v.size, v.color))
+        if all(cab.values()):
+            fin = min((s.bbox[1] for s in spans if any(s.text.strip().startswith(f) for f in C["fin"])),
+                      default=page.rect.height)
+            y0 = max(cab[k].bbox[3] for k in ("col_cantidad", "col_precio", "col_total"))
+            x_desc = cab["col_descripcion"].bbox[0]
+            x_cant = min(cab[k].bbox[0] for k in ("col_cantidad", "col_precio")) - 5
+            x_max_desc = fin_desc.bbox[0] - 2 if fin_desc else x_cant - 35
+            filas = sorted((s for s in spans if T["precio"].match(s.text) and y0 < s.bbox[1] < fin
+                            and abs(s.bbox[2] - cab["col_total"].bbox[2]) <= C["tol_x"]
+                            and not any(_misma_fila(s, et, 3) for _, et in etiquetas_sub)),
+                           key=lambda s: s.bbox[1])
+            for tot in filas:
+                def en_col(k: str) -> Span | None:
+                    return next((s for s in spans if T["precio"].match(s.text) and _misma_fila(s, tot)
+                                 and abs(s.bbox[2] - cab[k].bbox[2]) <= C["tol_x"]), None)
+                cant, prec = en_col("col_cantidad"), en_col("col_precio")
+                if cant is None or prec is None:
+                    ex.errores.append(f"p{page.number + 1}: fila sin cantidad o sin precio")
+                    continue
+                ref = " ".join(s.text.strip() for s in sorted(spans, key=lambda s: (s.bbox[1], s.bbox[0]))
+                               if x_desc - 5 <= s.bbox[0] < x_max_desc
+                               and tot.bbox[1] - 2 <= s.bbox[1] < tot.bbox[1] + C["alto_ref"])
+                # Unidades y medidas (columnas entre la descripción y la cantidad), para reconocer la línea.
+                medio = " ".join(s.text.strip() for s in sorted(spans, key=lambda s: s.bbox[0])
+                                 if fin_desc and x_max_desc <= s.bbox[0] < x_cant and _misma_fila(s, tot, 3))
+                if medio:
+                    ref = f"{ref} ({medio})"
+                ex.lineas.append(Linea(page.number, C["tipo"], ref or "(sin descripción)", 1,
+                                       tot.text.strip(), tot.text.strip(), prec.bbox, tot.bbox,
+                                       prec.origin, tot.origin, tot.size, tot.color, None,
+                                       parse_eur(cant.text), prec.text.strip()))
+        # Totales: valores bajo la fila de títulos (rangos por el borde derecho, relativos al ancla).
+        ancla = next((s for s in spans if s.text.strip() == TC["ancla"]), None)
+        if ancla is None:
+            continue
+        bajo = [s for s in spans if ancla.bbox[3] - 1 <= s.bbox[1] <= ancla.bbox[3] + TC["alto"]]
+
+        def valor(r: tuple, patron: re.Pattern) -> Span | None:
+            return next((s for s in bajo if patron.match(s.text)
+                         and ancla.bbox[0] + r[0] <= s.bbox[2] <= ancla.bbox[0] + r[1]), None)
+        pct = valor(TC["iva_pct"], T["pct"])
+        for label, r in TC["columnas"].items():
+            v = valor(r, T["precio"])
+            if v is not None:
+                ex.totales.append(Total(page.number, label, v.text.strip(),
+                                        pct.text.strip() if label == "IVA" and pct else None,
+                                        v.bbox, v.origin, v.size, v.color, solo_valor=True))
+    return ex
+
+
+def extract_uds(doc: fitz.Document, T: dict) -> Extraccion:
     ex = Extraccion()
     for page in doc:
         spans = page_spans(page)
@@ -304,8 +431,12 @@ def validate(ex: Extraccion) -> list[str]:
     for ln in ex.lineas:
         if (parse_eur(ln.importe) * ln.uds - parse_eur(ln.total)).copy_abs() > TOL:
             err.append(f"{ln.ref}: importe × uds ≠ total")
+        if ln.cantidad is not None and \
+                ((ln.cantidad * parse_eur(ln.precio)).quantize(CENT, ROUND_HALF_UP) - parse_eur(ln.total)).copy_abs() > TOL:
+            err.append(f"{ln.ref[:40]}: cantidad × precio ≠ total")
         if ln.tipo == "otro":
             err.append(f"p{ln.pagina + 1}: línea no reconocida ({ln.ref[:40]}); decidir en la plantilla")
+    err += validate_subtotales(ex, [parse_eur(ln.total) for ln in ex.lineas])
     if sum(1 for ln in ex.lineas if ln.tipo == "montaje") > 1:
         err.append("más de una línea de montaje")
     # "Total" (sin IVA) es opcional: algunos formatos solo traen Base Imponible, IVA y TOTAL.
@@ -319,6 +450,9 @@ def validate(ex: Extraccion) -> list[str]:
         err.append(f"suma de líneas {fmt_eur(suma)} ≠ base {base.valor}")
     if total and (parse_eur(total.valor) - b).copy_abs() > TOL:
         err.append("Total ≠ Base Imponible")
+    if iva.iva_pct is None:
+        err.append("IVA sin porcentaje")
+        return err
     pct = parse_pct(iva.iva_pct)
     if ((b * pct / 100).quantize(CENT, ROUND_HALF_UP) - parse_eur(iva.valor)).copy_abs() > TOL:
         err.append("IVA ≠ base × %")
@@ -332,6 +466,21 @@ def validate(ex: Extraccion) -> list[str]:
 
 def tiene_montaje(ex: Extraccion) -> bool:
     return any(ln.tipo == "montaje" for ln in ex.lineas)
+
+
+def subtotales_esperados(ex: Extraccion, totales_lineas: list[Decimal]) -> list[Decimal]:
+    """Lo que debe valer cada subtotal: "sigue" = suma hasta su página; "anterior" = suma de las previas."""
+    out = []
+    for st in ex.subtotales:
+        hasta = st.pagina + (1 if st.tipo == "sigue" else 0)
+        out.append(sum((t for ln, t in zip(ex.lineas, totales_lineas) if ln.pagina < hasta), Decimal(0)))
+    return out
+
+
+def validate_subtotales(ex: Extraccion, totales_lineas: list[Decimal]) -> list[str]:
+    return [f"p{st.pagina + 1}: subtotal {st.valor} ≠ suma de líneas {fmt_eur(e)}"
+            for st, e in zip(ex.subtotales, subtotales_esperados(ex, totales_lineas))
+            if (parse_eur(st.valor) - e).copy_abs() > TOL]
 
 
 def validate_params(ex: Extraccion, montaje: Decimal | None, pct_lineas: dict[int, Decimal],
@@ -412,6 +561,8 @@ def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> li
     if M is None:
         return [f"marca: la plantilla {T['id']} no define zonas para la marca del montador"]
     err = []
+    if conservar_fabrica and marca.logo and not M["logo_con_fabrica"]:
+        err.append("marca: con la cabecera del fabricante conservada, este formato no tiene hueco para tu logo")
     if marca.logo is not None:
         dim = dimensiones_imagen(marca.logo)
         if dim is None:
@@ -681,7 +832,8 @@ def calcular(ex: Extraccion, pct: Decimal, modo: str, montaje: Decimal | None,
     base = sum((l["total"] for l in lineas), Decimal(0)) + extra
     iva_pct = parse_pct(get_total(ex, "IVA").iva_pct)
     iva = (base * iva_pct / 100).quantize(CENT, ROUND_HALF_UP)
-    return {"lineas": lineas, "conceptos": [{"texto": c.texto, "importe": c.importe} for c in conceptos],
+    return {"lineas": lineas, "subtotales": subtotales_esperados(ex, [l["total"] for l in lineas]),
+            "conceptos": [{"texto": c.texto, "importe": c.importe} for c in conceptos],
             "extra": extra, "base": base, "iva_pct": iva_pct, "iva": iva, "total": base + iva}
 
 
@@ -743,6 +895,8 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
             page.add_redact_annot(pad(ln.rect_total), fill=False)
         for t in (t for t in ex.totales if t.pagina == n):
             page.add_redact_annot(pad(t.rect), fill=False)
+        for st in (st for st in ex.subtotales if st.pagina == n):
+            page.add_redact_annot(pad(st.rect), fill=False)
         # Datos de fábrica (salvo que el montador elija conservar su logo y su nombre).
         if not conservar_fabrica:
             if n == T["logo_pagina"]:
@@ -766,9 +920,18 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
         for ln, nuevo in zip(ex.lineas, calc["lineas"]):
             if ln.pagina != n:
                 continue
-            stamp_right(page, fmt_eur(nuevo["importe"]), ln.rect_importe[2], ln.origin_importe[1], ln.size, ln.color)
+            # Modo tabla: en la columna de precio, el precio por unidad de medida (total / cantidad).
+            unit = nuevo["importe"] if ln.cantidad is None else (nuevo["total"] / ln.cantidad).quantize(CENT, ROUND_HALF_UP)
+            stamp_right(page, fmt_eur(unit), ln.rect_importe[2], ln.origin_importe[1], ln.size, ln.color)
             stamp_right(page, fmt_eur(nuevo["total"]), ln.rect_total[2], ln.origin_total[1], ln.size, ln.color)
+        for st, valor in zip(ex.subtotales, calc["subtotales"]):
+            if st.pagina == n:
+                stamp_right(page, fmt_eur(valor), st.rect[2], st.origin[1], st.size, st.color)
         for t in (t for t in ex.totales if t.pagina == n):
+            if t.solo_valor:
+                valor = {"IVA": calc["iva"], "TOTAL": calc["total"]}.get(t.label, calc["base"])
+                stamp_right(page, fmt_eur(valor), t.rect[2], t.origin[1] + dy, t.size, t.color)
+                continue
             if t.label == "IVA":
                 txt = f"I.V.A {t.iva_pct} % : {fmt_eur(calc['iva'])} €"
             else:
@@ -848,16 +1011,22 @@ def verify_zonas_fabrica(doc: fitz.Document, T: dict, marca: Marca | None) -> li
     if any(fitz.Rect(i["bbox"]).intersects(zona_logo) and not (propia and propia.contains(fitz.Rect(i["bbox"])))
            for i in doc[T["logo_pagina"]].get_image_info()):
         err.append("logo de fábrica sigue en la cabecera")
+    M = T["marca"]
     for page in doc:
+        n = page.number
+        # Lo del montador que puede compartir hueco con la fábrica en esta página.
+        propias = list(marca.pie) + (list(marca.datos) if M and n == M["datos_pagina"] else [])
+        logo_propio = pad(M["zona_logo"], 1) if M and marca.logo and n == M["logo_pagina"] else None
         for z in T["zonas_fabrica_todas"]:
             r = fitz.Rect(z)
             resto = _normal(page.get_text(clip=r))
-            for linea in marca.pie:
+            for linea in propias:
                 resto = resto.replace(_normal(linea), "", 1)
             if resto.strip():
-                err.append(f"p{page.number + 1}: queda texto de fábrica en una zona de fábrica")
-            if any(fitz.Rect(i["bbox"]).intersects(r) for i in page.get_image_info()):
-                err.append(f"p{page.number + 1}: queda una imagen en una zona de fábrica")
+                err.append(f"p{n + 1}: queda texto de fábrica en una zona de fábrica")
+            if any(fitz.Rect(i["bbox"]).intersects(r) and not (logo_propio and logo_propio.contains(fitz.Rect(i["bbox"])))
+                   for i in page.get_image_info()):
+                err.append(f"p{n + 1}: queda una imagen en una zona de fábrica")
     return err
 
 
@@ -885,7 +1054,8 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | N
     # El montaje es precio del montador, no de fábrica: puede seguir apareciendo.
     fabrica = [ln for ln in src_ex.lineas if ln.tipo != "montaje"]
     originales = {ln.importe for ln in fabrica} | {ln.total for ln in fabrica} \
-        | {t.valor for t in src_ex.totales}
+        | {ln.precio for ln in fabrica if ln.precio} | {t.valor for t in src_ex.totales} \
+        | {st.valor for st in src_ex.subtotales}
     for v in sorted(originales):
         if money_regex(v).search(texto):
             err.append(f"precio de fábrica {v} sigue en el texto")
@@ -933,6 +1103,13 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | N
     suma = sum((parse_eur(l.total) for l in out_ex.lineas), Decimal(0)) + calc["extra"]
     if (suma - calc["base"]).copy_abs() > TOL:
         err.append("suma de líneas estampadas ≠ base estampada")
+    if len(out_ex.subtotales) != len(src_ex.subtotales) or any(
+            (parse_eur(st.valor) - e).copy_abs() > TOL for st, e in zip(out_ex.subtotales, calc["subtotales"])):
+        err.append("subtotales estampados ≠ calculados")
+    for got, exp in zip(out_ex.lineas, calc["lineas"]):
+        if got.cantidad is not None and \
+                ((got.cantidad * parse_eur(got.precio)) - exp["total"]).copy_abs() > got.cantidad * Decimal("0.005") + TOL:
+            err.append(f"{exp['ref'][:40]}: precio por unidad estampado no cuadra con el total")
     if out_ex.n_dibujos != src_ex.n_dibujos:
         err.append(f"nº de dibujos en salida {out_ex.n_dibujos} ≠ original {src_ex.n_dibujos}")
 
