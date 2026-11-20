@@ -33,6 +33,9 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
         sin_pos = raw.get("lineas_sin_pos", "otro")
         if sin_pos not in ("otro", "extra"):
             raise ValueError(f"lineas_sin_pos desconocido: {sin_pos!r}")
+        mn = raw.get("montaje_nuevo")
+        if mn is not None and mn["ancla"] not in ("Base Imponible", "Total", "IVA", "TOTAL"):
+            raise ValueError(f"montaje_nuevo.ancla desconocida: {mn['ancla']!r}")
         pie_defecto = (marca or {}).get("pie_por_defecto")
         if pie_defecto not in (None, "datos"):
             raise ValueError(f"pie_por_defecto desconocido: {pie_defecto!r}")
@@ -47,6 +50,11 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             # Líneas con precio pero sin cabecera "Pos." (ni montaje): "otro" = sin decidir (needs_review);
             # "extra" = suplemento de fábrica (vidrio, perfil…): lleva el % como una ventana, sin dibujo.
             "lineas_sin_pos": sin_pos,
+            # Opcional: si el PDF no trae línea de instalación, dónde se añade la del montador, relativa
+            # a un total (borde derecho = el del total + dx; línea base = la del total + dy).
+            "montaje_nuevo": None if mn is None else {
+                "etiqueta": str(mn["etiqueta"]), "ancla": mn["ancla"], "dx": float(mn["dx"]), "dy": float(mn["dy"]),
+            },
             "precio": re.compile(raw["precio"]),
             "totales": re.compile(raw["totales"]),
             # Dibujo de ventana: imagen que empieza justo bajo la cabecera "Pos." y a la izquierda.
@@ -61,6 +69,11 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             "marca": None if marca is None else {
                 "logo_pagina": marca["zona_logo"]["pagina"] - 1,
                 "zona_logo": tuple(marca["zona_logo"]["rect"]),
+                "logo_derecha": False,
+                # Opcional: si el logo de fábrica se conserva y comparte hueco con el del montador,
+                # el del montador va aquí (alineado a la derecha).
+                "logo_conservando": None if "zona_logo_conservando" not in marca else (
+                    marca["zona_logo_conservando"]["pagina"] - 1, tuple(marca["zona_logo_conservando"]["rect"])),
                 "datos_pagina": marca["zona_datos"]["pagina"] - 1,
                 "zona_datos": tuple(marca["zona_datos"]["rect"]),
                 "zona_pie": tuple(marca["zona_pie"]["rect"]),
@@ -300,10 +313,15 @@ def validate(ex: Extraccion) -> list[str]:
     return err
 
 
-def validate_params(ex: Extraccion, montaje: Decimal | None, pct_lineas: dict[int, Decimal]) -> list[str]:
+def tiene_montaje(ex: Extraccion) -> bool:
+    return any(ln.tipo == "montaje" for ln in ex.lineas)
+
+
+def validate_params(ex: Extraccion, montaje: Decimal | None, pct_lineas: dict[int, Decimal],
+                    T: dict | None = None) -> list[str]:
     """Parámetros que solo se pueden comprobar contra las líneas extraídas."""
     err = []
-    if montaje is not None and not any(ln.tipo == "montaje" for ln in ex.lineas):
+    if montaje is not None and not tiene_montaje(ex) and (T is None or T["montaje_nuevo"] is None):
         err.append("se indicó montaje pero el PDF no tiene línea de instalación donde escribirlo")
     for i in sorted(pct_lineas):
         if not 0 <= i < len(ex.lineas):
@@ -335,12 +353,22 @@ def logo_pixmap(b: bytes) -> fitz.Pixmap:
     return pix
 
 
-def rect_logo(w: int, h: int, zona: tuple) -> fitz.Rect:
-    """Logo ajustado a la zona conservando la proporción, alineado a la izquierda y centrado en vertical."""
+def rect_logo(w: int, h: int, zona: tuple, derecha: bool = False) -> fitz.Rect:
+    """Logo ajustado a la zona conservando la proporción, centrado en vertical y alineado a un lado."""
     z = fitz.Rect(zona)
     k = min(z.width / w, z.height / h)
     y0 = z.y0 + (z.height - h * k) / 2
-    return fitz.Rect(z.x0, y0, z.x0 + w * k, y0 + h * k)
+    x0 = z.x1 - w * k if derecha else z.x0
+    return fitz.Rect(x0, y0, x0 + w * k, y0 + h * k)
+
+
+def plantilla_efectiva(T: dict, conservar_fabrica: bool) -> dict:
+    """Con el logo de fábrica conservado, el del montador pasa a su zona alternativa (si la hay)."""
+    M = T["marca"]
+    if not conservar_fabrica or M is None or M["logo_conservando"] is None:
+        return T
+    pagina, zona = M["logo_conservando"]
+    return {**T, "marca": {**M, "logo_pagina": pagina, "zona_logo": zona, "logo_derecha": True}}
 
 
 def tam_texto(lineas: list[str], zona: tuple, tams: tuple[float, float]) -> float | None:
@@ -390,6 +418,45 @@ def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> li
     return err
 
 
+@dataclass
+class MontajeNuevo:
+    """Línea de instalación que se añade cuando el PDF no la trae (precio del montador, sin %)."""
+    pagina: int
+    texto: str
+    x1: float
+    y: float
+    size: float
+    color: int
+
+    @property
+    def rect(self) -> fitz.Rect:
+        w = FONT.text_length(self.texto, fontsize=self.size)
+        return fitz.Rect(self.x1 - w, self.y - self.size, self.x1, self.y + self.size * 0.25)
+
+
+def montaje_nuevo(ex: Extraccion, T: dict, importe: Decimal | None) -> MontajeNuevo | None:
+    """Dónde y cómo se escribe la instalación añadida; None si no toca (sin importe o el PDF ya la trae)."""
+    M = T["montaje_nuevo"]
+    if importe is None or tiene_montaje(ex) or M is None:
+        return None
+    ancla = get_total(ex, M["ancla"])
+    if ancla is None:
+        return None
+    return MontajeNuevo(ancla.pagina, f"{M['etiqueta']}: {fmt_eur(importe)} €",
+                        ancla.rect[2] + M["dx"], ancla.origin[1] + M["dy"], ancla.size, ancla.color)
+
+
+def validate_hueco(pdf: bytes, mn: MontajeNuevo) -> list[str]:
+    """La instalación añadida solo se escribe en un hueco vacío del PDF original (ni texto ni imágenes)."""
+    with fitz.open(stream=pdf, filetype="pdf") as doc:
+        page = doc[mn.pagina]
+        r = pad(tuple(mn.rect), 1)
+        if not page.rect.contains(r) or page.get_text(clip=r).strip() or \
+                any(fitz.Rect(i["bbox"]).intersects(r) for i in page.get_image_info()):
+            return ["no hay hueco libre en el PDF para añadir la línea de instalación"]
+    return []
+
+
 def pie_de_datos(datos: list[str], zona: tuple) -> list[str]:
     """Datos de empresa como pie: en una línea si caben; si no, repartidos en dos."""
     una = [" · ".join(datos)]
@@ -415,7 +482,9 @@ def precio_cliente(coste: Decimal, pct: Decimal, modo: str) -> Decimal:
 
 def calcular(ex: Extraccion, pct: Decimal, modo: str, montaje: Decimal | None,
              pct_lineas: dict[int, Decimal]) -> dict:
-    """Ventanas: coste de fábrica + % (global o de la línea). Montaje: precio del montador, sin %."""
+    """Ventanas: coste de fábrica + % (global o de la línea). Montaje: precio del montador, sin %.
+
+    Si el PDF no trae línea de instalación, el montaje indicado se suma aparte (montaje_nuevo)."""
     lineas = []
     for i, ln in enumerate(ex.lineas):
         if ln.tipo == "montaje":
@@ -426,10 +495,12 @@ def calcular(ex: Extraccion, pct: Decimal, modo: str, montaje: Decimal | None,
             unit = precio_cliente(parse_eur(ln.importe), p, modo)
         lineas.append({"ref": ln.ref, "tipo": ln.tipo, "uds": ln.uds, "pct": p,
                        "importe": unit, "total": unit * ln.uds})
-    base = sum((l["total"] for l in lineas), Decimal(0))
+    nuevo = montaje if montaje is not None and not tiene_montaje(ex) else None
+    base = sum((l["total"] for l in lineas), Decimal(0)) + (nuevo or 0)
     iva_pct = parse_pct(get_total(ex, "IVA").iva_pct)
     iva = (base * iva_pct / 100).quantize(CENT, ROUND_HALF_UP)
-    return {"lineas": lineas, "base": base, "iva_pct": iva_pct, "iva": iva, "total": base + iva}
+    return {"lineas": lineas, "montaje_nuevo": nuevo, "base": base, "iva_pct": iva_pct, "iva": iva,
+            "total": base + iva}
 
 
 def stamp_right(page: fitz.Page, text: str, x1: float, y: float, size: float, color: int) -> None:
@@ -474,7 +545,7 @@ def zonas_marca(marca: Marca | None, T: dict, n: int) -> list[tuple]:
 
 
 def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Marca | None = None,
-                     conservar_fabrica: bool = False) -> bytes:
+                     conservar_fabrica: bool = False, mn: MontajeNuevo | None = None) -> bytes:
     doc = fitz.open(stream=pdf, filetype="pdf")
     labels = {"Base Imponible": "Base Imponible", "Total": "Total", "TOTAL": "TOTAL"}
     for page in doc:
@@ -513,12 +584,14 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
                 valor = calc["total"] if t.label == "TOTAL" else calc["base"]
                 txt = f"{labels[t.label]}: {fmt_eur(valor)} €"
             stamp_right(page, txt, t.rect[2], t.origin[1], t.size, t.color)
+        if mn is not None and mn.pagina == n:
+            stamp_right(page, mn.texto, mn.x1, mn.y, mn.size, mn.color)
 
         if marca is not None and not marca.vacia:
             M = T["marca"]
             if marca.logo and n == M["logo_pagina"]:
                 pix = logo_pixmap(marca.logo)
-                page.insert_image(rect_logo(pix.width, pix.height, M["zona_logo"]), pixmap=pix)
+                page.insert_image(rect_logo(pix.width, pix.height, M["zona_logo"], M["logo_derecha"]), pixmap=pix)
             if marca.datos and n == M["datos_pagina"]:
                 stamp_bloque(page, marca.datos, M["zona_datos"], TAM_DATOS, derecha=True)
             if marca.pie:
@@ -599,8 +672,8 @@ def verify_zonas_fabrica(doc: fitz.Document, T: dict, marca: Marca | None) -> li
     return err
 
 
-def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
-           marca: Marca | None = None, conservar_fabrica: bool = False) -> tuple[list[str], list[bytes]]:
+def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | None = None,
+           conservar_fabrica: bool = False, mn: MontajeNuevo | None = None) -> tuple[list[str], list[bytes]]:
     """Verificación de salida obligatoria (sección 'Redacción real y verificación de salida').
 
     Devuelve los errores y una miniatura PNG por página para la pantalla de descarga.
@@ -608,6 +681,10 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
     err = []
     doc = fitz.open(stream=pdf, filetype="pdf")
     texto = "\n".join(p.get_text() for p in doc)
+    if mn is not None:
+        if _normal(mn.texto) not in _normal(doc[mn.pagina].get_text()):
+            err.append("línea de instalación añadida no estampada")
+        texto = texto.replace(mn.texto, "")  # precio del montador: puede coincidir con uno de fábrica
 
     # El montaje es precio del montador, no de fábrica: puede seguir apareciendo.
     fabrica = [ln for ln in src_ex.lineas if ln.tipo != "montaje"]
@@ -652,7 +729,7 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
         t = get_total(out_ex, label)
         if not t or (parse_eur(t.valor) - exp).copy_abs() > TOL:
             err.append(f"total '{label}' estampado {t.valor if t else '—'} ≠ {fmt_eur(exp)}")
-    suma = sum((parse_eur(l.total) for l in out_ex.lineas), Decimal(0))
+    suma = sum((parse_eur(l.total) for l in out_ex.lineas), Decimal(0)) + (calc["montaje_nuevo"] or 0)
     if (suma - calc["base"]).copy_abs() > TOL:
         err.append("suma de líneas estampadas ≠ base estampada")
     if out_ex.n_dibujos != src_ex.n_dibujos:
@@ -728,7 +805,9 @@ def analizar(pdf: bytes, T: dict) -> Resultado:
     ex, errores = _analisis(pdf, T)
     datos = {"plantilla": T["id"], "estado": "needs_review" if errores else "ok", "errores": errores,
              "n_dibujos": ex.n_dibujos, "lineas": _lineas_publicas(ex, None),
-             "totales_fabrica": _totales_fabrica(ex) if not errores else None}
+             "totales_fabrica": _totales_fabrica(ex) if not errores else None,
+             # Sin línea de instalación en el PDF pero la plantilla sabe dónde añadirla: la app pide el montaje.
+             "montaje_nuevo": not errores and not tiene_montaje(ex) and T["montaje_nuevo"] is not None}
     return Resultado(datos, dibujos=[] if errores else recortar_dibujos(pdf, ex))
 
 
@@ -739,10 +818,16 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
 
     conservar_fabrica: deja el logo y el nombre de la fábrica (los precios se eliminan siempre)."""
     pct_lineas = pct_lineas or {}
+    T = plantilla_efectiva(T, conservar_fabrica)
     marca = marca_efectiva(marca or Marca(), T, conservar_fabrica)
     ex, errores = _analisis(pdf, T)
+    mn = None
     if not errores:
-        errores = validate_params(ex, montaje, pct_lineas) + validate_marca(marca, T, conservar_fabrica)
+        errores = validate_params(ex, montaje, pct_lineas, T) + validate_marca(marca, T, conservar_fabrica)
+    if not errores:
+        mn = montaje_nuevo(ex, T, montaje)
+        if mn is not None:
+            errores = validate_hueco(pdf, mn)
     datos = {"plantilla": T["id"], "pct": pct, "modo": modo, "montaje": montaje,
              "pct_lineas": {str(k): v for k, v in sorted(pct_lineas.items())},
              "marca": not marca.vacia, "conservar_fabrica": conservar_fabrica, "n_dibujos": ex.n_dibujos}
@@ -750,10 +835,11 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
     miniaturas: list[bytes] = []
     if not errores:
         calc = calcular(ex, pct, modo, montaje, pct_lineas)
-        salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica)
-        errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica)
+        salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica, mn)
+        errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica, mn)
     datos["lineas"] = _lineas_publicas(ex, calc)
     datos["totales"] = {k: calc[k] for k in ("base", "iva_pct", "iva", "total")} if calc else None
+    datos["montaje_nuevo"] = calc["montaje_nuevo"] if calc else None
     datos["estado"] = "needs_review" if errores else "ok"
     datos["errores"] = errores
     if errores:

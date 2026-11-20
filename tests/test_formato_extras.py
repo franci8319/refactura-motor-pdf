@@ -79,3 +79,39 @@ def test_sin_marca_quita_logo_y_pie_de_fabrica(sample):
         for z in PLANTILLA["redaccion"]["zonas_fabrica_todas"]:
             assert not p.get_text(clip=fitz.Rect(z)).strip()
     assert base64.b64decode(d["miniaturas"][0]).startswith(b"\x89PNG")
+
+
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_montaje_nuevo_se_anade_y_suma(sample):
+    """Sin línea de instalación en el PDF, el montaje se escribe en el hueco de la plantilla y suma a la base."""
+    if "montaje_nuevo" not in PLANTILLA:
+        pytest.skip("la plantilla no define montaje_nuevo")
+    almacen = Almacen(sample.read_bytes())
+    d = generar(cliente(almacen), plantilla=PLANTILLA, pct=38, montaje="4000.00").json()
+    assert d["estado"] == "ok", d["errores"]
+    assert d["montaje_nuevo"] == "4000.00"
+    assert not any(ln["tipo"] == "montaje" for ln in d["lineas"])
+    lineas = sum(Decimal(ln["total"]) for ln in d["lineas"])
+    assert lineas + Decimal("4000.00") == Decimal(d["totales"]["base"])
+    salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
+    texto = " ".join("".join(p.get_text() for p in salida).split())
+    assert f"{PLANTILLA['montaje_nuevo']['etiqueta']}: 4.000,00 €" in texto
+
+
+@pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
+def test_conservando_logo_de_fabrica_el_del_montador_va_aparte(sample):
+    if "zona_logo_conservando" not in PLANTILLA["marca"]:
+        pytest.skip("la plantilla no define zona_logo_conservando")
+    original = fitz.open(stream=sample.read_bytes(), filetype="pdf")
+    almacen = Almacen(sample.read_bytes())
+    d = generar(cliente(almacen), plantilla=PLANTILLA, conservar_fabrica=True,
+                marca={"logo": MARCA["logo"], "pie": MARCA["pie"]}).json()
+    assert d["estado"] == "ok", d["errores"]
+    salida = fitz.open(stream=almacen.subidas[0], filetype="pdf")
+    fab = fitz.Rect(PLANTILLA["redaccion"]["zona_logo_fabrica"]["rect"])
+    alt = fitz.Rect(PLANTILLA["marca"]["zona_logo_conservando"]["rect"])
+
+    def imgs(doc, zona):
+        return [i["bbox"] for i in doc[0].get_image_info() if fitz.Rect(i["bbox"]).intersects(zona)]
+    assert imgs(salida, fab) == imgs(original, fab) != []  # el de fábrica, intacto
+    assert len(imgs(salida, alt)) == 1  # el del montador, en su zona
