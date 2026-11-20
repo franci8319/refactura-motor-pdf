@@ -30,6 +30,12 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
         a, red, dib = raw["anclas"], raw["redaccion"], raw["dibujo"]
         logo = red["zona_logo_fabrica"]
         marca = raw.get("marca")
+        sin_pos = raw.get("lineas_sin_pos", "otro")
+        if sin_pos not in ("otro", "extra"):
+            raise ValueError(f"lineas_sin_pos desconocido: {sin_pos!r}")
+        pie_defecto = (marca or {}).get("pie_por_defecto")
+        if pie_defecto not in (None, "datos"):
+            raise ValueError(f"pie_por_defecto desconocido: {pie_defecto!r}")
         return {
             "id": f"{raw['id']}-v{raw['version']}",
             "huella": raw["huella"],
@@ -38,6 +44,9 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             "ancla_montaje": re.compile(a["montaje"], re.I),
             "ancla_importe": a["col_importe"],
             "ancla_total_col": a["col_total"],
+            # Líneas con precio pero sin cabecera "Pos." (ni montaje): "otro" = sin decidir (needs_review);
+            # "extra" = suplemento de fábrica (vidrio, perfil…): lleva el % como una ventana, sin dibujo.
+            "lineas_sin_pos": sin_pos,
             "precio": re.compile(raw["precio"]),
             "totales": re.compile(raw["totales"]),
             # Dibujo de ventana: imagen que empieza justo bajo la cabecera "Pos." y a la izquierda.
@@ -46,6 +55,8 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             "logo_pagina": logo["pagina"] - 1,
             "zona_logo_fabrica": tuple(logo["rect"]),  # x0, y0, x1, y1
             "lista_negra": red["lista_negra"],
+            # Zonas con datos de fábrica en todas las páginas (p. ej. su pie): se vacían enteras.
+            "zonas_fabrica_todas": [tuple(r) for r in red.get("zonas_fabrica_todas", [])],
             # Opcional: dónde va la marca del montador (logo y datos en la pág. indicada, pie en todas).
             "marca": None if marca is None else {
                 "logo_pagina": marca["zona_logo"]["pagina"] - 1,
@@ -53,6 +64,8 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
                 "datos_pagina": marca["zona_datos"]["pagina"] - 1,
                 "zona_datos": tuple(marca["zona_datos"]["rect"]),
                 "zona_pie": tuple(marca["zona_pie"]["rect"]),
+                # "datos": sin pie propio, los datos de empresa van también en el pie.
+                "pie_por_defecto": pie_defecto,
             },
         }
     except (KeyError, TypeError, re.error) as e:
@@ -91,7 +104,7 @@ class Span:
 @dataclass
 class Linea:
     pagina: int
-    tipo: str  # "ventana" | "montaje" | "otro"
+    tipo: str  # "ventana" | "montaje" | "extra" | "otro"
     ref: str
     uds: int
     importe: str
@@ -233,7 +246,7 @@ def extract(doc: fitz.Document, T: dict) -> Extraccion:
                 ref = " ".join(s.text.strip() for s in spans
                                if y_prev < s.bbox[1] < fila.bbox[1] and not s.bold
                                and fila.bbox[0] - 200 < s.bbox[0] < fila.bbox[2] + 100)
-                tipo = "montaje" if T["ancla_montaje"].search(ref) else "otro"
+                tipo = "montaje" if T["ancla_montaje"].search(ref) else T["lineas_sin_pos"]
                 dibujo = None
             ex.lineas.append(Linea(page.number, tipo, ref or "(sin descripción)", uds,
                                    imp.text.strip(), tot.text.strip(), imp.bbox, tot.bbox,
@@ -265,15 +278,16 @@ def validate(ex: Extraccion) -> list[str]:
             err.append(f"p{ln.pagina + 1}: línea no reconocida ({ln.ref[:40]}); decidir en la plantilla")
     if sum(1 for ln in ex.lineas if ln.tipo == "montaje") > 1:
         err.append("más de una línea de montaje")
+    # "Total" (sin IVA) es opcional: algunos formatos solo traen Base Imponible, IVA y TOTAL.
     base, total, iva, total_iva = (get_total(ex, k) for k in ("Base Imponible", "Total", "IVA", "TOTAL"))
-    if not all((base, total, iva, total_iva)):
-        err.append("faltan totales (Base Imponible / Total / IVA / TOTAL)")
+    if not all((base, iva, total_iva)):
+        err.append("faltan totales (Base Imponible / IVA / TOTAL)")
         return err
     suma = sum((parse_eur(ln.total) for ln in ex.lineas), Decimal(0))
     b = parse_eur(base.valor)
     if (suma - b).copy_abs() > TOL:
         err.append(f"suma de líneas {fmt_eur(suma)} ≠ base {base.valor}")
-    if (parse_eur(total.valor) - b).copy_abs() > TOL:
+    if total and (parse_eur(total.valor) - b).copy_abs() > TOL:
         err.append("Total ≠ Base Imponible")
     pct = parse_pct(iva.iva_pct)
     if ((b * pct / 100).quantize(CENT, ROUND_HALF_UP) - parse_eur(iva.valor)).copy_abs() > TOL:
@@ -376,6 +390,23 @@ def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> li
     return err
 
 
+def pie_de_datos(datos: list[str], zona: tuple) -> list[str]:
+    """Datos de empresa como pie: en una línea si caben; si no, repartidos en dos."""
+    una = [" · ".join(datos)]
+    if len(datos) < 2 or tam_texto(una, zona, TAM_PIE) is not None:
+        return una
+    corte = min(range(1, len(datos)), key=lambda i: abs(len(" · ".join(datos[:i])) - len(" · ".join(datos[i:]))))
+    return [" · ".join(datos[:corte]), " · ".join(datos[corte:])]
+
+
+def marca_efectiva(marca: Marca, T: dict, conservar_fabrica: bool) -> Marca:
+    """Aplica pie_por_defecto: si la plantilla lo pide y el montador no tiene pie, sus datos van al pie."""
+    M = T["marca"]
+    if conservar_fabrica or marca.pie or not marca.datos or M is None or M["pie_por_defecto"] != "datos":
+        return marca
+    return Marca(marca.logo, marca.datos, pie_de_datos(marca.datos, M["zona_pie"]))
+
+
 def precio_cliente(coste: Decimal, pct: Decimal, modo: str) -> Decimal:
     p = pct / 100
     v = coste * (1 + p) if modo == "markup" else coste / (1 - p)
@@ -460,6 +491,8 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
         if not conservar_fabrica:
             if n == T["logo_pagina"]:
                 page.add_redact_annot(fitz.Rect(T["zona_logo_fabrica"]), fill=False)
+            for z in T["zonas_fabrica_todas"]:
+                page.add_redact_annot(fitz.Rect(z), fill=False)
             for palabra in T["lista_negra"]:
                 for r in page.search_for(palabra):
                     page.add_redact_annot(pad(tuple(r)), fill=False)
@@ -543,6 +576,29 @@ def verify_marca(doc: fitz.Document, marca: Marca, T: dict) -> list[str]:
     return err
 
 
+def verify_zonas_fabrica(doc: fitz.Document, T: dict, marca: Marca | None) -> list[str]:
+    """Zonas de fábrica vacías: en la del logo solo puede quedar el logo del montador (si comparten
+    hueco) y en las de todas las páginas solo el pie del montador (si comparten hueco)."""
+    err = []
+    marca = marca or Marca()
+    zona_logo = fitz.Rect(T["zona_logo_fabrica"])
+    propia = pad(T["marca"]["zona_logo"], 1) if marca.logo and T["marca"] else None
+    if any(fitz.Rect(i["bbox"]).intersects(zona_logo) and not (propia and propia.contains(fitz.Rect(i["bbox"])))
+           for i in doc[T["logo_pagina"]].get_image_info()):
+        err.append("logo de fábrica sigue en la cabecera")
+    for page in doc:
+        for z in T["zonas_fabrica_todas"]:
+            r = fitz.Rect(z)
+            resto = _normal(page.get_text(clip=r))
+            for linea in marca.pie:
+                resto = resto.replace(_normal(linea), "", 1)
+            if resto.strip():
+                err.append(f"p{page.number + 1}: queda texto de fábrica en una zona de fábrica")
+            if any(fitz.Rect(i["bbox"]).intersects(r) for i in page.get_image_info()):
+                err.append(f"p{page.number + 1}: queda una imagen en una zona de fábrica")
+    return err
+
+
 def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
            marca: Marca | None = None, conservar_fabrica: bool = False) -> tuple[list[str], list[bytes]]:
     """Verificación de salida obligatoria (sección 'Redacción real y verificación de salida').
@@ -577,9 +633,8 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
         err.append("capas (OCG) presentes")
     if any(list(p.annots()) or list(p.widgets()) for p in doc):
         err.append("anotaciones o formularios presentes")
-    zona_logo = fitz.Rect(T["zona_logo_fabrica"])
-    if not conservar_fabrica and             any(fitz.Rect(i["bbox"]).intersects(zona_logo) for i in doc[T["logo_pagina"]].get_image_info()):
-        err.append("logo de fábrica sigue en la cabecera")
+    if not conservar_fabrica:
+        err += verify_zonas_fabrica(doc, T, marca)
     if marca is not None:
         err += verify_marca(doc, marca, T)
 
@@ -590,7 +645,9 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict,
         if (parse_eur(got.total) - exp["total"]).copy_abs() > TOL or \
                 (parse_eur(got.importe) - exp["importe"]).copy_abs() > TOL:
             err.append(f"{exp['ref']}: estampado {got.importe}/{got.total} ≠ calculado")
-    esperados = {"Base Imponible": calc["base"], "Total": calc["base"], "IVA": calc["iva"], "TOTAL": calc["total"]}
+    esperados = {"Base Imponible": calc["base"], "IVA": calc["iva"], "TOTAL": calc["total"]}
+    if get_total(src_ex, "Total"):
+        esperados["Total"] = calc["base"]
     for label, exp in esperados.items():
         t = get_total(out_ex, label)
         if not t or (parse_eur(t.valor) - exp).copy_abs() > TOL:
@@ -682,7 +739,7 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
 
     conservar_fabrica: deja el logo y el nombre de la fábrica (los precios se eliminan siempre)."""
     pct_lineas = pct_lineas or {}
-    marca = marca or Marca()
+    marca = marca_efectiva(marca or Marca(), T, conservar_fabrica)
     ex, errores = _analisis(pdf, T)
     if not errores:
         errores = validate_params(ex, montaje, pct_lineas) + validate_marca(marca, T, conservar_fabrica)
