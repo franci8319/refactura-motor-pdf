@@ -43,14 +43,15 @@ def load_template(path: Path) -> dict:
 
 
 def process(src: Path, pct: Decimal, modo: str, montaje: Decimal | None, T: dict, marca: Marca,
-            conservar_fabrica: bool = False, conceptos: list[Concepto] | None = None) -> dict:
+            conservar_fabrica: bool = False, conceptos: list[Concepto] | None = None,
+            iva: Decimal | None = None) -> dict:
     out = OUT_DIR / src.stem
     out.mkdir(parents=True, exist_ok=True)
     # No dejar salida ni miniaturas viejas junto a un needs_review.
     for viejo in [out / "salida.pdf", *out.glob("p*.png")]:
         viejo.unlink(missing_ok=True)
     r = generar(src.read_bytes(), T, pct, modo, montaje, marca=marca, conservar_fabrica=conservar_fabrica,
-                conceptos=conceptos)
+                conceptos=conceptos, iva_pct=iva)
     if r.ok:
         (out / "salida.pdf").write_bytes(r.pdf)
         for i, png in enumerate(r.miniaturas, 1):
@@ -73,6 +74,7 @@ def main() -> int:
     ap.add_argument("--logo", type=Path, help="logo del montador (PNG o JPEG)")
     ap.add_argument("--dato", action="append", default=[], help="línea de datos del montador (repetible)")
     ap.add_argument("--pie", action="append", default=[], help="línea del pie del montador (repetible)")
+    ap.add_argument("--iva", type=Decimal, help="% de IVA del presupuesto del cliente (por defecto, el del PDF)")
     ap.add_argument("--condiciones", type=Path, help="archivo de texto con las condiciones del montador")
     ap.add_argument("--concepto", action="append", default=[], metavar="TEXTO=IMPORTE",
                     help="línea añadida sin %% (repetible), p. ej. --concepto 'Portes=150'")
@@ -98,7 +100,7 @@ def main() -> int:
 
     fallos = 0
     for src in pdfs:
-        r = process(src, args.pct, args.modo, args.montaje, T, marca, args.conservar_fabrica, conceptos)
+        r = process(src, args.pct, args.modo, args.montaje, T, marca, args.conservar_fabrica, conceptos, args.iva)
         print(f"\n== {src.name}: {r['estado'].upper()} ({len(r['lineas'])} líneas, {r['n_dibujos']} dibujos)")
         for ln in r["lineas"]:
             extra = f" -> {fmt_eur(ln['total'])}" if "total" in ln else ""

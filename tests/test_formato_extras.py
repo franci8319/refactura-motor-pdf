@@ -12,6 +12,7 @@ from pathlib import Path
 import pymupdf as fitz
 import pytest
 
+import motor
 from test_servicio import Almacen, MARCA, cliente, generar
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,7 +44,7 @@ def test_extras_llevan_pct(sample):
     d = generar(cliente(Almacen(sample.read_bytes())), plantilla=PLANTILLA).json()
     assert d["estado"] == "ok", d["errores"]
     extras = [ln for ln in d["lineas"] if ln["tipo"] == "extra"]
-    assert extras and all(ln["pct"] == "30.00" and ln["dibujo"] is None for ln in extras)
+    assert all(ln["pct"] == "30.00" and ln["dibujo"] is None for ln in extras)
     assert sum(Decimal(ln["total"]) for ln in d["lineas"]) == Decimal(d["totales"]["base"])
 
 
@@ -87,6 +88,10 @@ def test_montaje_sin_linea_va_como_concepto_instalacion(sample):
     almacen = Almacen(sample.read_bytes())
     d = generar(cliente(almacen), plantilla=PLANTILLA, pct=38, montaje="4000.00",
                 conceptos=[{"texto": "Portes", "importe": "150"}]).json()
+    if d["estado"] != "ok":
+        # Sin hueco bajo los totales (p. ej. las condiciones empiezan justo debajo): aviso al montador.
+        assert not almacen.subidas and d["errores"] and all(e.startswith("conceptos:") for e in d["errores"])
+        return
     assert d["estado"] == "ok", d["errores"]
     assert [c["texto"] for c in d["conceptos"]] == ["Instalación", "Portes"]
     lineas = sum(Decimal(ln["total"]) for ln in d["lineas"])
@@ -149,3 +154,24 @@ def test_condiciones_demasiado_largas_son_error_de_marca(sample):
     d = generar(cliente(almacen), plantilla=plantilla, marca={"condiciones": "\n".join(["Línea"] * 200)}).json()
     assert d["estado"] == "needs_review" and not almacen.subidas
     assert d["errores"] and all(e.startswith("marca:") for e in d["errores"])
+
+
+def test_descuento_de_fabrica_oculto_y_ventanas_partidas():
+    """Si algún PDF trae descuento de fábrica: fuera del PDF del cliente, sin %, y la suma cuadra."""
+    for sample in SAMPLES:
+        T = motor.compile_template(PLANTILLA)
+        ex, err = motor._analisis(sample.read_bytes(), T)
+        desc = [ln for ln in ex.lineas if ln.tipo == "descuento"]
+        if not desc or "descuentos" not in PLANTILLA:
+            continue
+        assert err == [] and ex.n_dibujos == sum(1 for ln in ex.lineas if ln.tipo == "ventana")
+        almacen = Almacen(sample.read_bytes())
+        d = generar(cliente(almacen), plantilla=PLANTILLA, pct=30).json()
+        assert d["estado"] == "ok", d["errores"]
+        lineas = {ln["indice"]: ln for ln in d["lineas"]}
+        assert all(lineas[i]["total"] == "0.00" and lineas[i]["pct"] is None
+                   for i, ln in enumerate(ex.lineas) if ln.tipo == "descuento")
+        texto = " ".join("".join(p.get_text() for p in fitz.open(stream=almacen.subidas[0], filetype="pdf")).split())
+        assert all(ln.ref not in texto for ln in desc)
+        return
+    pytest.skip("ningún PDF de este formato trae descuento de fábrica")

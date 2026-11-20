@@ -8,7 +8,7 @@ el worker lo descarga de una URL firmada del bucket temporal y sube el generado 
                       → huella, extracción y validación (lo que el montador revisa); cada línea
                         lleva "dibujo_png" (PNG en base64 del dibujo de la ventana, o null)
   POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?, conservar_fabrica?,
-                        conceptos?}
+                        conceptos?, iva_pct?}
                       → redacción, estampado, verificación de salida y subida del PDF (PUT a salida_url)
                         marca = {logo?: PNG/JPEG en base64, datos?: [líneas], pie?: [líneas], condiciones?: texto};
                         logo, datos y pie necesitan que la plantilla defina sus zonas ("marca"); condiciones
@@ -131,6 +131,7 @@ class PeticionGenerar(PeticionAnalizar):
     marca: PeticionMarca | None = None
     conservar_fabrica: bool = False  # deja el logo y el nombre de la fábrica; los precios se eliminan siempre
     conceptos: list[PeticionConcepto] = Field(default_factory=list, max_length=20)  # la plantilla fija el máximo
+    iva_pct: Decimal | None = Field(default=None, ge=0, le=100, decimal_places=2)  # sin él, el del PDF
 
     @model_validator(mode="after")
     def _pcts(self) -> PeticionGenerar:
@@ -228,7 +229,7 @@ def crear_app(cfg: Config | None = None, transporte: httpx.BaseTransport | None 
         pdf = _descargar(cliente, p.pdf_url, cfg)
         conceptos = [motor.Concepto(c.texto.strip(), c.importe) for c in p.conceptos]
         r = _con_motor(motor.generar, pdf, T, p.pct, p.modo, p.montaje, p.pct_lineas, marca,
-                       p.conservar_fabrica, conceptos)
+                       p.conservar_fabrica, conceptos, p.iva_pct)
         if not r.ok:
             return {**r.datos, "entregado": False}
         _subir(cliente, p.salida_url, r.pdf)
