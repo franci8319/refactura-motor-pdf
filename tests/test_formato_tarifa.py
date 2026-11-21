@@ -5,6 +5,7 @@ totales, que no se mueve. Usa una plantilla privada de ../templates/ con "tabla.
 
 from __future__ import annotations
 
+import copy
 from decimal import ROUND_HALF_UP, Decimal
 
 import pymupdf as fitz
@@ -111,6 +112,43 @@ def test_conceptos_sin_hueco_es_error(plantilla, sample):
     r = motor.generar(doc.tobytes(), T, Decimal(30), conceptos=[motor.Concepto("Instalación", Decimal(400))])
     assert not r.ok and r.datos["errores"]
     assert all(e.startswith("conceptos:") for e in r.datos["errores"]), r.datos["errores"]
+
+
+@casos
+def test_descuento_en_cascada_se_lee_y_se_quita(plantilla, sample):
+    """Descuentos en cascada ("47+0", "50+10"): cuentan como uno solo en el cuadre y no quedan en el PDF,
+    tampoco en las filas sin precio."""
+    plantilla = copy.deepcopy(plantilla)
+    plantilla["huella"]["fuentes"].append("Helvetica")  # el texto de prueba se escribe con Helvetica
+    T = motor.compile_template(plantilla)
+    doc = fitz.open(stream=sample.read_bytes(), filetype="pdf")
+    ex = motor.extract(doc, T)
+
+    def linea_de(p: int, r: tuple):
+        return next((ln for ln in ex.lineas if ln.pagina == p and abs(ln.rect_total[1] - r[1]) <= 2.5), None)
+    con_precio = next((p, r, linea_de(p, r)) for p, r in ex.vaciar if linea_de(p, r) and linea_de(p, r).dto)
+    sin_precio = next((p, r) for p, r in ex.vaciar if linea_de(p, r) is None)
+    cambios = [(con_precio[0], con_precio[1], f"{motor.fmt_pct(con_precio[2].dto)}+0"), (*sin_precio, "50+10")]
+    for p, r, texto in cambios:
+        doc[p].add_redact_annot(motor.pad(r))
+        doc[p].apply_redactions()
+        doc[p].insert_text((r[0], r[3] - 1.5), texto, fontsize=7, fontname="helv")
+    pdf = doc.tobytes()
+    ex2, err = motor._analisis(pdf, T)
+    assert err == []
+    assert linea_de(con_precio[0], con_precio[1]) is not None
+    r = motor.generar(pdf, T, Decimal(30))
+    assert r.ok, r.datos["errores"]
+    texto = "".join(p.get_text() for p in fitz.open(stream=r.pdf, filetype="pdf"))
+    assert "50+10" not in texto and "+0" not in texto
+
+
+def test_descuento_en_cascada_equivale_al_producto():
+    assert motor.parse_dto("50+10") == Decimal("55.00")
+    assert motor.parse_dto("47") == Decimal("47")
+    assert motor.parse_dto("47 %") == Decimal("47")
+    assert motor.parse_dto("40+11,67") == Decimal("47.00")
+    assert motor.parse_dto("N/A") is None and motor.parse_dto("150") is None
 
 
 @casos

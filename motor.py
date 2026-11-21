@@ -359,7 +359,7 @@ def extract_tabla(doc: fitz.Document, T: dict) -> Extraccion:
                            key=lambda s: s.bbox[1])
             if col_dto is not None:
                 # Toda la columna de descuento, también en filas sin precio (cabecera del producto, sin cargo…).
-                ex.vaciar += [(page.number, s.bbox) for s in spans if T["pct"].match(s.text)
+                ex.vaciar += [(page.number, s.bbox) for s in spans if DTO_CELDA.match(s.text)
                               and y0 < s.bbox[1] < fin and abs(s.bbox[2] - col_dto.bbox[2]) <= C["tol_x"]]
             patron_cant = C["cantidad"] or T["precio"]
             for tot in filas:
@@ -374,8 +374,11 @@ def extract_tabla(doc: fitz.Document, T: dict) -> Extraccion:
                 cantidad = parse_eur(patron_cant.match(cant.text).group(1)) if cant else Decimal(UDS.match(uds.text).group(1))
                 dto = None
                 if col_dto is not None:
-                    d = en_col(col_dto, T["pct"])
-                    dto = parse_pct(T["pct"].match(d.text).group(1)) if d else Decimal(0)
+                    d = en_col(col_dto, DTO_CELDA)
+                    dto = parse_dto(d.text) if d else Decimal(0)
+                    if dto is None:
+                        ex.errores.append(f"p{page.number + 1}: descuento no reconocido ({d.text.strip()[:12]})")
+                        continue
                 ref = " ".join(s.text.strip() for s in sorted(spans, key=lambda s: (s.bbox[1], s.bbox[0]))
                                if x_desc - 5 <= s.bbox[0] < x_max_desc
                                and tot.bbox[1] - 2 <= s.bbox[1] < tot.bbox[1] + C["alto_ref"])
@@ -427,6 +430,22 @@ def extract_tabla(doc: fitz.Document, T: dict) -> Extraccion:
 
 
 UDS = re.compile(r"^\s*(\d{1,4})\s*$")
+DTO_CELDA = re.compile(r"^[\d\s.,+%-]*\d[\d\s.,+%-]*$")  # cualquier descuento escrito: "47", "47 %", "50+10"
+PCT_DTO = re.compile(r"\s*(\d{1,2}(?:,\d{1,2})?)\s*")
+
+
+def parse_dto(texto: str) -> Decimal | None:
+    """% de descuento de una celda; en cascada ("50+10") equivale a 1 − (1 − 0,50)·(1 − 0,10) = 55 %.
+    None si no se entiende."""
+    f = Decimal(1)
+    for parte in texto.replace("%", "").split("+"):
+        m = PCT_DTO.fullmatch(parte)
+        if m is None:
+            return None
+        f *= 1 - parse_pct(m.group(1)) / 100
+    return ((1 - f) * 100).quantize(CENT, ROUND_HALF_UP)
+
+
 PRECIO_NEGATIVO = re.compile(r"^\s*-\d{1,3}(?:\.\d{3})*,\d{2}\s*$")
 
 
@@ -1357,7 +1376,8 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | N
             err.append("condiciones del montador no estampadas o con restos del texto original")
 
     out_ex = extract(doc, T)
-    if out_ex.vaciar:
+    # Un concepto del montador puede caer a la altura de la columna: lo de su bloque no cuenta.
+    if any(not (bc is not None and p == bc.pagina and fitz.Rect(r).intersects(bc.bloque)) for p, r in out_ex.vaciar):
         err.append("queda el descuento de fábrica en su columna")
     visibles = [c for ln, c in zip(src_ex.lineas, calc["lineas"]) if ln.tipo != "descuento"]
     for ln in (l for l in src_ex.lineas if l.tipo == "descuento"):
