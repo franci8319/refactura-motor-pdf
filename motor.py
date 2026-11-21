@@ -430,9 +430,9 @@ UDS = re.compile(r"^\s*(\d{1,4})\s*$")
 PRECIO_NEGATIVO = re.compile(r"^\s*-\d{1,3}(?:\.\d{3})*,\d{2}\s*$")
 
 
-def _caja_de(page: fitz.Page, fila: Span) -> tuple | None:
-    """El recuadro de ancho completo más pequeño que contiene la fila (para quitar un bloque entero)."""
-    r = fitz.Rect(fila.bbox)
+def _caja_de(page: fitz.Page, rect: tuple) -> tuple | None:
+    """El recuadro de ancho completo más pequeño que contiene el rect (una fila, un total…)."""
+    r = fitz.Rect(rect)
     cajas = [fitz.Rect(d["rect"]) for d in page.get_drawings()
              if fitz.Rect(d["rect"]).contains(r) and fitz.Rect(d["rect"]).width > page.rect.width * 0.7]
     return tuple(min(cajas, key=lambda c: c.height)) if cajas else None
@@ -495,7 +495,7 @@ def extract_uds(doc: fitz.Document, T: dict) -> Extraccion:
                 if not T["descuento"].search(ref):
                     ex.errores.append(f"p{page.number + 1}: línea en negativo no reconocida ({ref[:40]})")
                     continue
-                tipo, dibujo, caja = "descuento", None, _caja_de(page, fila)
+                tipo, dibujo, caja = "descuento", None, _caja_de(page, fila.bbox)
                 if caja is None:
                     ex.errores.append(f"p{page.number + 1}: no se encuentra el recuadro del descuento")
                     continue
@@ -713,6 +713,7 @@ PAD_CONCEPTOS = 5.0  # pt de margen interior arriba y abajo del bloque
 INTERLINEA_CONCEPTOS = 1.6  # paso entre filas, en veces el tamaño de letra de los totales
 HUECO_CONCEPTOS = 6.0  # pt entre el bloque nuevo y el recuadro de totales
 SANGRIA = 12.0  # pt desde el borde izquierdo del recuadro
+TRAZO_FINO = 0.3  # pt: imita la línea finísima (grosor 0) de los recuadros originales
 
 
 @dataclass
@@ -732,6 +733,8 @@ class BloqueConceptos:
     filas: list[tuple[str, str, float]]  # texto, importe "1.234,56 €", línea base
     # Si bajo los totales hay contenido (p. ej. las condiciones), esta franja baja también `desplazamiento`.
     mover: fitz.Rect | None = None
+    # El bloque va en el hueco libre encima del recuadro de totales, que se queda donde está.
+    totales_fijos: bool = False
 
     @property
     def caja_nueva(self) -> fitz.Rect:
@@ -756,13 +759,24 @@ def plan_conceptos(pdf: bytes, ex: Extraccion, T: dict, conceptos: list[Concepto
     ancla = get_total(ex, C["ancla"])
     if ancla is None or any(t.pagina != ancla.pagina for t in ex.totales):
         return None, ["conceptos: los totales no están juntos en una página"]
-    c0, c1, c2, c3 = C["caja"]
-    caja = fitz.Rect(ancla.rect[2] + c0, ancla.rect[1] + c1, ancla.rect[2] + c2, ancla.rect[1] + c3)
     size = ancla.size
     paso = size * INTERLINEA_CONCEPTOS
-    bloque = fitz.Rect(caja.x0, caja.y0, caja.x1, caja.y0 + 2 * PAD_CONCEPTOS + paso * (len(conceptos) + 1))
-    desplazamiento = bloque.height + HUECO_CONCEPTOS
-    x_importe = ancla.rect[2]
+    alto = 2 * PAD_CONCEPTOS + paso * (len(conceptos) + 1)
+    if C["totales_fijos"]:
+        # El recuadro de totales es el que contiene el ancla; el bloque se apoya encima y nada se mueve.
+        with fitz.open(stream=pdf, filetype="pdf") as doc:
+            r = _caja_de(doc[ancla.pagina], ancla.rect)
+        if r is None:
+            return None, ["conceptos: no se encuentra el recuadro de totales en el PDF"]
+        caja = fitz.Rect(r)
+        bloque = fitz.Rect(caja.x0, caja.y0 - alto, caja.x1, caja.y0)
+        desplazamiento = 0.0
+    else:
+        c0, c1, c2, c3 = C["caja"]
+        caja = fitz.Rect(ancla.rect[2] + c0, ancla.rect[1] + c1, ancla.rect[2] + c2, ancla.rect[1] + c3)
+        bloque = fitz.Rect(caja.x0, caja.y0, caja.x1, caja.y0 + alto)
+        desplazamiento = bloque.height + HUECO_CONCEPTOS
+    x_importe = ancla.rect[2] if C["importe_dx"] is None else caja.x1 + C["importe_dx"]
     y_titulo = bloque.y0 + PAD_CONCEPTOS + size * 1.1
     filas = [(c.texto, f"{fmt_eur(c.importe)} €", y_titulo + paso * (i + 1)) for i, c in enumerate(conceptos)]
 
@@ -785,6 +799,23 @@ def plan_conceptos(pdf: bytes, ex: Extraccion, T: dict, conceptos: list[Concepto
         recuadro = next((d for d in dibujos if _parecido(d["rect"], caja)), None)
         if recuadro is None:
             return None, ["conceptos: no se encuentra el recuadro de totales en el PDF"]
+        if C["totales_fijos"]:
+            # El hueco tiene que estar libre: ni texto, ni imágenes, ni trazos (las líneas tienen alto 0: se
+            # ensanchan), salvo los del propio recuadro de totales y los que contienen el bloque entero (el marco).
+            cosas = [fitz.Rect(b[:4]) for b in page.get_text("blocks") if b[4].strip()] + \
+                [fitz.Rect(i["bbox"]) for i in page.get_image_info()] + \
+                [pad(tuple(d["rect"])) for d in dibujos
+                 if not pad(tuple(caja), 1).contains(fitz.Rect(d["rect"]))
+                 and not pad(tuple(d["rect"]), 1).contains(bloque)]
+            if any(c.intersects(bloque) for c in cosas):
+                return None, [f"conceptos: no caben {len(conceptos)} líneas añadidas encima de los totales; "
+                              "quita alguna o júntalas"]
+            trazo = recuadro.get("color") or (0, 0, 0)
+            # Grosor 0 = línea finísima del PDF; draw_rect la pintaría de 1 pt: se imita con una fina.
+            ancho = recuadro.get("width")
+            return BloqueConceptos(ancla.pagina, caja, bloque, desplazamiento, size, ancla.color, tuple(trazo),
+                                   1.0 if ancho is None else (ancho or TRAZO_FINO), x_importe, y_titulo, filas,
+                                   totales_fijos=True), []
         # En el recuadro solo pueden estar los totales: se vacía entero y se redibuja más abajo.
         totales = [t for t in ex.totales if t.pagina == ancla.pagina]
         def lineas(texto: str) -> list[str]:
@@ -841,13 +872,14 @@ def mover_contenido(doc: fitz.Document, page: fitz.Page, zona: fitz.Rect, dy: fl
 
 def stamp_conceptos(page: fitz.Page, b: BloqueConceptos) -> None:
     """Vacía el recuadro de totales (trazos incluidos), dibuja el bloque de conceptos y el recuadro movido.
-    Los totales se estampan aparte, desplazados."""
-    page.add_redact_annot(pad(tuple(b.caja), 2), fill=False)
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
-                          graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
-                          text=fitz.PDF_REDACT_TEXT_REMOVE)
-    page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
-    for r in (b.bloque, b.caja_nueva):
+    Los totales se estampan aparte, desplazados. Con totales fijos, solo se dibuja el bloque."""
+    if not b.totales_fijos:
+        page.add_redact_annot(pad(tuple(b.caja), 2), fill=False)
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                              graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                              text=fitz.PDF_REDACT_TEXT_REMOVE)
+        page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
+    for r in (b.bloque,) if b.totales_fijos else (b.bloque, b.caja_nueva):
         page.draw_rect(r, color=b.trazo, width=b.ancho_trazo)
     rgb = tuple(((b.color >> s) & 0xFF) / 255 for s in (16, 8, 0))
     page.insert_text((b.caja.x0 + SANGRIA, b.y_titulo), TITULO_CONCEPTOS, fontname=FONT_NAME,
