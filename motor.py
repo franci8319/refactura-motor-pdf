@@ -74,16 +74,30 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
                     # Opcional: la descripción acaba donde empieza esta columna; las de en medio
                     # (unidades, medidas…) se añaden a la referencia entre paréntesis.
                     "col_fin_descripcion": t.get("col_fin_descripcion"),
+                    # Opcional: regex propia de la columna de cantidad (metraje con unidad, "4,15ML"); si la fila
+                    # no tiene cantidad, valen las unidades de col_uds.
+                    "cantidad": re.compile(t["cantidad"]) if "cantidad" in t else None,
+                    "col_uds": t.get("col_uds"),
+                    # Opcional: descuento de fábrica (%) por fila: cuenta en el cuadre y se vacía entero del PDF.
+                    "col_dto": t.get("col_dto"),
+                    # "aprox": cantidad y precio llevan decimales ocultos; el cuadre de la fila admite su redondeo.
+                    "cuadre": t.get("cuadre", "exacto"),
                 },
                 # Totales en columnas: valores bajo una fila de títulos. Rangos del borde derecho del valor,
                 # relativos al x0 del ancla (un título de esa fila).
                 "totales_columnas": {
                     "ancla": tc["ancla"], "alto": float(tc.get("alto", 22)),
                     "columnas": {k: tuple(float(v) for v in r) for k, r in tc["columnas"].items()},
-                    "iva_pct": tuple(float(v) for v in tc["iva_pct"]),
+                    # % de IVA en la fila de valores (rango, como las columnas) o dentro del título de su columna.
+                    "iva_pct": tuple(float(v) for v in tc["iva_pct"]) if "iva_pct" in tc else None,
+                    "iva_titulo": re.compile(tc["iva_titulo"]) if "iva_titulo" in tc else None,
                 },
                 "pct": re.compile(raw.get("pct", r"^\s*(\d{1,2}(?:,\d{1,2})?)\s*$")),
             }
+            if T["tabla"]["cuadre"] not in ("exacto", "aprox"):
+                raise ValueError(f"tabla.cuadre desconocido: {T['tabla']['cuadre']!r}")
+            if (T["totales_columnas"]["iva_pct"] is None) == (T["totales_columnas"]["iva_titulo"] is None):
+                raise ValueError("totales_columnas necesita iva_pct o iva_titulo (uno de los dos)")
         return T | {
             "id": f"{raw['id']}-v{raw['version']}",
             "huella": raw["huella"],
@@ -101,14 +115,22 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             # Opcional: líneas que añade el montador ("Otros conceptos": instalación, portes…) en un bloque
             # encima del recuadro de totales, que baja para hacer sitio. "caja" = recuadro de totales relativo
             # al ancla: [x0 − x1_ancla, y0 − y0_ancla, x1 − x1_ancla, y1 − y0_ancla].
+            # "totales_fijos": el bloque va en el hueco libre encima del recuadro de totales (el recuadro que
+            # contiene el ancla), que no se mueve; "importe_dx": x de los importes respecto a su borde derecho.
             "conceptos": None if con is None else {
-                "ancla": con["ancla"], "caja": tuple(float(v) for v in con["caja"]),
-                "margen_inferior": float(con["margen_inferior"]), "max_lineas": int(con.get("max_lineas", 10)),
+                "ancla": con["ancla"], "totales_fijos": bool(con.get("totales_fijos", False)),
+                "caja": None if con.get("totales_fijos") else tuple(float(v) for v in con["caja"]),
+                "importe_dx": None if "importe_dx" not in con else float(con["importe_dx"]),
+                "margen_inferior": float(con.get("margen_inferior", 0) if con.get("totales_fijos") else con["margen_inferior"]),
+                "max_lineas": int(con.get("max_lineas", 10)),
             },
             "precio": re.compile(raw["precio"]),
             "logo_pagina": logo["pagina"] - 1,
             "zona_logo_fabrica": tuple(logo["rect"]),  # x0, y0, x1, y1
             "lista_negra": red["lista_negra"],
+            # Opcional: líneas de texto que empiezan así (forma de pago entre fábrica y montador…) se quitan
+            # enteras, aunque el montador conserve el logo de la fábrica.
+            "lineas_fuera": list(red.get("lineas_fuera", [])),
             # Zonas con datos de fábrica en todas las páginas (p. ej. su pie): se vacían enteras.
             "zonas_fabrica_todas": [tuple(r) for r in red.get("zonas_fabrica_todas", [])],
             # Opcional: dónde va la marca del montador (logo y datos en la pág. indicada, pie en todas).
@@ -183,6 +205,7 @@ class Linea:
     precio: str | None = None
     pagina_dibujo: int | None = None  # si la ventana empieza en la página anterior (Pos. y dibujo allí)
     caja: tuple | None = None  # descuento: recuadro que se quita entero del PDF del cliente
+    dto: Decimal | None = None  # modo tabla con columna de descuento: % de fábrica de la fila (0 si no lleva)
 
 
 @dataclass
@@ -198,6 +221,8 @@ class Total:
     solo_valor: bool = False  # modo tabla: el valor va solo, bajo su título de columna
     pct_rect: tuple | None = None  # modo tabla: casilla del % de IVA (se reescribe si el montador lo cambia)
     pct_origin: tuple | None = None
+    pct_marco: tuple[str, str] | None = None  # % dentro de un título: texto de antes y de después del número
+    sufijo: str = ""  # "€" pegado al valor en el original: se estampa igual
 
 
 @dataclass
@@ -219,6 +244,8 @@ class Extraccion:
     n_dibujos: int = 0
     errores: list[str] = field(default_factory=list)
     subtotales: list[Subtotal] = field(default_factory=list)
+    vaciar: list[tuple[int, tuple]] = field(default_factory=list)  # (página, rect): columna de descuento
+    cuadre_aprox: bool = False  # el cuadre de cada fila admite el redondeo de cantidad y precio
 
 
 @dataclass
@@ -302,12 +329,14 @@ def extract_tabla(doc: fitz.Document, T: dict) -> Extraccion:
     """Presupuesto en tabla (sin dibujos): filas con precio en la columna del total, subtotales entre
     páginas y totales en columnas bajo su fila de títulos."""
     C, TC = T["tabla"], T["totales_columnas"]
-    ex = Extraccion()
+    ex = Extraccion(cuadre_aprox=C["cuadre"] == "aprox")
     for page in doc:
         spans = page_spans(page)
-        cab = {k: next((s for s in spans if s.text.strip() == C[k]), None)
-               for k in ("col_cantidad", "col_precio", "col_total", "col_descripcion")}
-        fin_desc = C["col_fin_descripcion"] and next((s for s in spans if s.text.strip() == C["col_fin_descripcion"]), None)
+
+        def cabecera(k: str) -> Span | None:
+            return next((s for s in spans if s.text.strip() == C[k]), None) if C[k] else None
+        cab = {k: cabecera(k) for k in ("col_cantidad", "col_precio", "col_total", "col_descripcion")}
+        fin_desc, col_uds, col_dto = cabecera("col_fin_descripcion"), cabecera("col_uds"), cabecera("col_dto")
         etiquetas_sub = [(tipo, s) for s in spans for tipo, texto in C["subtotales"].items()
                          if s.text.strip().startswith(texto)]
         for tipo, et in etiquetas_sub:
@@ -328,14 +357,25 @@ def extract_tabla(doc: fitz.Document, T: dict) -> Extraccion:
                             and abs(s.bbox[2] - cab["col_total"].bbox[2]) <= C["tol_x"]
                             and not any(_misma_fila(s, et, 3) for _, et in etiquetas_sub)),
                            key=lambda s: s.bbox[1])
+            if col_dto is not None:
+                # Toda la columna de descuento, también en filas sin precio (cabecera del producto, sin cargo…).
+                ex.vaciar += [(page.number, s.bbox) for s in spans if T["pct"].match(s.text)
+                              and y0 < s.bbox[1] < fin and abs(s.bbox[2] - col_dto.bbox[2]) <= C["tol_x"]]
+            patron_cant = C["cantidad"] or T["precio"]
             for tot in filas:
-                def en_col(k: str) -> Span | None:
-                    return next((s for s in spans if T["precio"].match(s.text) and _misma_fila(s, tot)
-                                 and abs(s.bbox[2] - cab[k].bbox[2]) <= C["tol_x"]), None)
-                cant, prec = en_col("col_cantidad"), en_col("col_precio")
-                if cant is None or prec is None:
+                def en_col(col: Span, patron: re.Pattern) -> Span | None:
+                    return next((s for s in spans if patron.match(s.text) and _misma_fila(s, tot)
+                                 and abs(s.bbox[2] - col.bbox[2]) <= C["tol_x"]), None)
+                cant, prec = en_col(cab["col_cantidad"], patron_cant), en_col(cab["col_precio"], T["precio"])
+                uds = en_col(col_uds, UDS) if cant is None and col_uds is not None else None
+                if (cant is None and uds is None) or prec is None:
                     ex.errores.append(f"p{page.number + 1}: fila sin cantidad o sin precio")
                     continue
+                cantidad = parse_eur(patron_cant.match(cant.text).group(1)) if cant else Decimal(UDS.match(uds.text).group(1))
+                dto = None
+                if col_dto is not None:
+                    d = en_col(col_dto, T["pct"])
+                    dto = parse_pct(T["pct"].match(d.text).group(1)) if d else Decimal(0)
                 ref = " ".join(s.text.strip() for s in sorted(spans, key=lambda s: (s.bbox[1], s.bbox[0]))
                                if x_desc - 5 <= s.bbox[0] < x_max_desc
                                and tot.bbox[1] - 2 <= s.bbox[1] < tot.bbox[1] + C["alto_ref"])
@@ -347,28 +387,46 @@ def extract_tabla(doc: fitz.Document, T: dict) -> Extraccion:
                 ex.lineas.append(Linea(page.number, C["tipo"], ref or "(sin descripción)", 1,
                                        tot.text.strip(), tot.text.strip(), prec.bbox, tot.bbox,
                                        prec.origin, tot.origin, tot.size, tot.color, None,
-                                       parse_eur(cant.text), prec.text.strip()))
+                                       cantidad, prec.text.strip(), dto=dto))
         # Totales: valores bajo la fila de títulos (rangos por el borde derecho, relativos al ancla).
         ancla = next((s for s in spans if s.text.strip() == TC["ancla"]), None)
         if ancla is None:
             continue
         bajo = [s for s in spans if ancla.bbox[3] - 1 <= s.bbox[1] <= ancla.bbox[3] + TC["alto"]]
 
-        def valor(r: tuple, patron: re.Pattern) -> Span | None:
-            return next((s for s in bajo if patron.match(s.text)
-                         and ancla.bbox[0] + r[0] <= s.bbox[2] <= ancla.bbox[0] + r[1]), None)
-        pct = valor(TC["iva_pct"], T["pct"])
+        def valor(r: tuple, patron: re.Pattern) -> tuple[Span, str, str] | None:
+            """Span, texto sin "€" y sufijo ("€" si lo llevaba pegado)."""
+            for s in bajo:
+                texto = s.text.strip()
+                sufijo = "€" if texto.endswith("€") else ""
+                texto = texto.removesuffix("€").strip()
+                if patron.match(texto) and ancla.bbox[0] + r[0] <= s.bbox[2] <= ancla.bbox[0] + r[1]:
+                    return s, texto, sufijo
+            return None
+        pct: tuple[Span, str] | None = None
+        marco = None
+        if TC["iva_titulo"] is not None:
+            for s in spans:
+                m = TC["iva_titulo"].search(s.text)
+                if m and _misma_fila(s, ancla, 3):
+                    pct, marco = (s, m.group(1)), (s.text[:m.start(1)].lstrip(), s.text[m.end(1):].rstrip())
+                    break
+        elif (v := valor(TC["iva_pct"], T["pct"])) is not None:
+            pct = v[0], v[1]
         for label, r in TC["columnas"].items():
             v = valor(r, T["precio"])
             if v is not None:
+                s, texto, sufijo = v
                 con_pct = label == "IVA" and pct is not None
-                ex.totales.append(Total(page.number, label, v.text.strip(), pct.text.strip() if con_pct else None,
-                                        v.bbox, v.origin, v.size, v.color, solo_valor=True,
-                                        pct_rect=pct.bbox if con_pct else None,
-                                        pct_origin=pct.origin if con_pct else None))
+                ex.totales.append(Total(page.number, label, texto, pct[1] if con_pct else None,
+                                        s.bbox, s.origin, s.size, s.color, solo_valor=True,
+                                        pct_rect=pct[0].bbox if con_pct else None,
+                                        pct_origin=pct[0].origin if con_pct else None,
+                                        pct_marco=marco if con_pct else None, sufijo=sufijo))
     return ex
 
 
+UDS = re.compile(r"^\s*(\d{1,4})\s*$")
 PRECIO_NEGATIVO = re.compile(r"^\s*-\d{1,3}(?:\.\d{3})*,\d{2}\s*$")
 
 
@@ -482,9 +540,12 @@ def validate(ex: Extraccion) -> list[str]:
     for ln in ex.lineas:
         if (parse_eur(ln.importe) * ln.uds - parse_eur(ln.total)).copy_abs() > TOL:
             err.append(f"{ln.ref}: importe × uds ≠ total")
-        if ln.cantidad is not None and \
-                ((ln.cantidad * parse_eur(ln.precio)).quantize(CENT, ROUND_HALF_UP) - parse_eur(ln.total)).copy_abs() > TOL:
-            err.append(f"{ln.ref[:40]}: cantidad × precio ≠ total")
+        if ln.cantidad is not None:
+            precio, f = parse_eur(ln.precio), 1 - (ln.dto or Decimal(0)) / 100
+            # Aproximado: cantidad y precio impresos con 2 decimales de valores que tienen más.
+            tol = (precio.copy_abs() + ln.cantidad) * f * Decimal("0.005") + TOL if ex.cuadre_aprox else TOL
+            if ((ln.cantidad * precio * f).quantize(CENT, ROUND_HALF_UP) - parse_eur(ln.total)).copy_abs() > tol:
+                err.append(f"{ln.ref[:40]}: cantidad × precio ≠ total")
         if ln.tipo == "otro":
             err.append(f"p{ln.pagina + 1}: línea no reconocida ({ln.ref[:40]}); decidir en la plantilla")
         if (ln.tipo == "descuento") != (parse_eur(ln.total) < 0):
@@ -943,10 +1004,13 @@ def calcular(ex: Extraccion, pct: Decimal, modo: str, montaje: Decimal | None,
             "extra": extra, "base": base, "iva_pct": iva_pct, "iva": iva, "total": base + iva}
 
 
-def stamp_right(page: fitz.Page, text: str, x1: float, y: float, size: float, color: int) -> None:
-    w = FONT.text_length(text, fontsize=size)
+def stamp_right(page: fitz.Page, text: str, x1: float, y: float, size: float, color: int,
+                regular: bool = False) -> None:
+    """Texto alineado a la derecha en x1. regular: fuente normal (ya insertada en la página), p. ej. un título."""
+    font, nombre = (FONT_REG, FONT_REG_NAME) if regular else (FONT, FONT_NAME)
+    w = font.text_length(text, fontsize=size)
     rgb = tuple(((color >> s) & 0xFF) / 255 for s in (16, 8, 0))
-    page.insert_text((x1 - w, y), text, fontname=FONT_NAME, fontsize=size, color=rgb)
+    page.insert_text((x1 - w, y), text, fontname=nombre, fontsize=size, color=rgb)
 
 
 def pad(r: tuple, d: float = 0.5) -> fitz.Rect:
@@ -967,6 +1031,15 @@ def stamp_bloque(page: fitz.Page, lineas: list[str], zona: tuple, tams: tuple[fl
         else:
             page.insert_text((z.x0, y), linea, fontname=FONT_NAME, fontsize=t, color=(0, 0, 0))
         y += paso
+
+
+def lineas_que_empiezan(page: fitz.Page, prefijos: list[str]) -> list[fitz.Rect]:
+    """Líneas de texto que empiezan por alguno de los prefijos (sin distinguir mayúsculas), enteras."""
+    pre = [p.lower() for p in prefijos]
+    if not pre:
+        return []
+    return [fitz.Rect(line["bbox"]) for b in page.get_text("dict")["blocks"] for line in b.get("lines", [])
+            if any("".join(s["text"] for s in line["spans"]).strip().lower().startswith(p) for p in pre)]
 
 
 def zonas_marca(marca: Marca | None, T: dict, n: int) -> list[tuple]:
@@ -1007,6 +1080,11 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
                 page.add_redact_annot(pad(t.pct_rect), fill=False)
         for st in (st for st in ex.subtotales if st.pagina == n):
             page.add_redact_annot(pad(st.rect), fill=False)
+        for pagina, r in ex.vaciar:
+            if pagina == n:
+                page.add_redact_annot(pad(r), fill=False)
+        for r in lineas_que_empiezan(page, T["lineas_fuera"]):
+            page.add_redact_annot(pad(tuple(r)), fill=False)
         # Datos de fábrica (salvo que el montador elija conservar su logo y su nombre).
         if not conservar_fabrica:
             if n == T["logo_pagina"]:
@@ -1051,10 +1129,15 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
         for t in (t for t in ex.totales if t.pagina == n):
             if t.solo_valor:
                 valor = {"IVA": calc["iva"], "TOTAL": calc["total"]}.get(t.label, calc["base"])
-                stamp_right(page, fmt_eur(valor), t.rect[2], t.origin[1] + dy, t.size, t.color)
+                stamp_right(page, fmt_eur(valor) + t.sufijo, t.rect[2], t.origin[1] + dy, t.size, t.color)
                 if t.pct_rect is not None:
-                    stamp_right(page, fmt_pct(calc["iva_pct"], t.iva_pct), t.pct_rect[2], t.pct_origin[1] + dy,
-                                t.size, t.color)
+                    pct = fmt_pct(calc["iva_pct"], t.iva_pct)
+                    if t.pct_marco is not None:  # % dentro del título de la columna: el título entero, en normal
+                        page.insert_font(fontname=FONT_REG_NAME, fontbuffer=FONT_REG.buffer)
+                        stamp_right(page, t.pct_marco[0] + pct + t.pct_marco[1], t.pct_rect[2],
+                                    t.pct_origin[1] + dy, t.size, t.color, regular=True)
+                    else:
+                        stamp_right(page, pct, t.pct_rect[2], t.pct_origin[1] + dy, t.size, t.color)
                 continue
             if t.label == "IVA":
                 txt = f"I.V.A {fmt_pct(calc['iva_pct'], t.iva_pct)} % : {fmt_eur(calc['iva'])} €"
@@ -1216,6 +1299,9 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | N
     for palabra in ([] if conservar_fabrica else T["lista_negra"]):
         if palabra.lower() in bajo:
             err.append(f"dato de fábrica '{palabra}' sigue en el texto")
+    for prefijo in T["lineas_fuera"]:
+        if prefijo.lower() in bajo:
+            err.append(f"'{prefijo}' sigue en el texto")
 
     meta = {k: v for k, v in doc.metadata.items() if k not in ("format", "encryption") and v}
     if meta:
@@ -1239,6 +1325,8 @@ def verify(src_ex: Extraccion, calc: dict, pdf: bytes, T: dict, marca: Marca | N
             err.append("condiciones del montador no estampadas o con restos del texto original")
 
     out_ex = extract(doc, T)
+    if out_ex.vaciar:
+        err.append("queda el descuento de fábrica en su columna")
     visibles = [c for ln, c in zip(src_ex.lineas, calc["lineas"]) if ln.tipo != "descuento"]
     for ln in (l for l in src_ex.lineas if l.tipo == "descuento"):
         if _normal(ln.ref) and _normal(ln.ref) in _normal(doc[ln.pagina].get_text()):
