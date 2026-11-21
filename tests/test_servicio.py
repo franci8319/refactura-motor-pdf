@@ -320,6 +320,38 @@ def test_concepto_no_valido_400():
 
 
 @con_samples
+def test_concepto_con_uds_y_precio():
+    if "conceptos" not in PLANTILLA:
+        pytest.skip("la plantilla no define conceptos")
+    almacen = Almacen(SAMPLES[0].read_bytes())
+    c = {"texto": "Retirada", "importe": "100.00", "uds": 2, "precio": "50.00"}
+    d = generar(cliente(almacen), conceptos=[c]).json()
+    assert d["estado"] == "ok", d["errores"]
+    assert d["conceptos"] == [c]
+
+
+@pytest.mark.parametrize("c", [
+    {"texto": "x", "importe": "90.00", "uds": 2, "precio": "50.00"},  # importe ≠ uds × precio
+    {"texto": "x", "importe": "100.00", "uds": 2},  # uds sin precio
+    {"texto": "x", "importe": "100.00", "precio": "50.00"},  # precio sin uds
+    {"texto": "x", "importe": "0.00", "uds": 0, "precio": "0.00"},
+    {"texto": "x", "importe": "1000.00", "uds": 1000, "precio": "1.00"},
+], ids=["no_cuadra", "uds_sin_precio", "precio_sin_uds", "uds_0", "uds_1000"])
+def test_concepto_uds_o_precio_no_validos_400(c):
+    assert generar(cliente(Almacen()), conceptos=[c]).status_code == 400
+
+
+@con_samples
+def test_concepto_sin_uds_ni_precio_sigue_igual():
+    if "conceptos" not in PLANTILLA:
+        pytest.skip("la plantilla no define conceptos")
+    almacen = Almacen(SAMPLES[0].read_bytes())
+    d = generar(cliente(almacen), conceptos=[{"texto": "Portes", "importe": "150"}]).json()
+    assert d["estado"] == "ok", d["errores"]
+    assert d["conceptos"] == [{"texto": "Portes", "importe": "150.00", "uds": 1, "precio": "150.00"}]
+
+
+@con_samples
 @pytest.mark.parametrize("sample", SAMPLES, ids=IDS)
 def test_condiciones_sin_pagina_de_condiciones_no_cambian_nada(sample):
     """El formato sin texto de condiciones de la fábrica no añade nada aunque el montador tenga las suyas."""

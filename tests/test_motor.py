@@ -106,7 +106,8 @@ def test_conceptos_suman_a_la_base_sin_pct():
     calc = motor.calcular(ex, Decimal(30), "markup", None, {}, conceptos)
     assert calc["extra"] == Decimal("450.00")
     assert calc["base"] == Decimal("130.00") + Decimal("65.00") + Decimal("450.00")
-    assert calc["conceptos"][0] == {"texto": "Instalación", "importe": Decimal("400.00")}
+    assert calc["conceptos"][0] == {"texto": "Instalación", "importe": Decimal("400.00"), "uds": 1,
+                                    "precio": Decimal("400.00")}
 
 
 def test_montaje_con_linea_en_el_pdf_se_escribe_en_ella():

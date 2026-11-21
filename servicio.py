@@ -120,6 +120,17 @@ class PeticionConcepto(BaseModel):
     model_config = ConfigDict(extra="forbid")
     texto: str = Field(min_length=1, max_length=80)
     importe: Decimal = Field(ge=-1_000_000, le=1_000_000, decimal_places=2)
+    # Formatos con los conceptos como filas de la tabla: unidades y precio por unidad (importe = uds × precio).
+    uds: int | None = Field(default=None, ge=1, le=999)
+    precio: Decimal | None = Field(default=None, ge=-1_000_000, le=1_000_000, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _uds_precio(self) -> PeticionConcepto:
+        if (self.uds is None) != (self.precio is None):
+            raise ValueError("uds y precio van juntos")
+        if self.uds is not None and self.importe != self.uds * self.precio:
+            raise ValueError("importe ≠ uds × precio")
+        return self
 
 
 class PeticionGenerar(PeticionAnalizar):
@@ -227,7 +238,7 @@ def crear_app(cfg: Config | None = None, transporte: httpx.BaseTransport | None 
         _comprobar_url(p.salida_url, cfg, "salida_url")
         marca = p.marca.a_motor() if p.marca else None
         pdf = _descargar(cliente, p.pdf_url, cfg)
-        conceptos = [motor.Concepto(c.texto.strip(), c.importe) for c in p.conceptos]
+        conceptos = [motor.Concepto(c.texto.strip(), c.importe, c.uds or 1, c.precio) for c in p.conceptos]
         r = _con_motor(motor.generar, pdf, T, p.pct, p.modo, p.montaje, p.pct_lineas, marca,
                        p.conservar_fabrica, conceptos, p.iva_pct)
         if not r.ok:
