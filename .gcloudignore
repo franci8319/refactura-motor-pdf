@@ -5,3 +5,5 @@
 !requirements.txt
 !motor.py
 !servicio.py
+!fuentes/
+!fuentes/**

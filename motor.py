@@ -10,6 +10,7 @@ es needs_review y no se devuelve PDF.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -24,6 +25,25 @@ FONT = fitz.Font("hebo")
 FONT_NAME = "MontBold"
 FONT_REG = fitz.Font("helv")  # Nimbus Sans regular, incrustada igual: texto largo (condiciones)
 FONT_REG_NAME = "MontReg"
+# Letra de los importes reescritos y de las filas añadidas, por plantilla ("fuente"): (normal, negrita), cada una
+# con su nombre en la página. comic-neue: letra libre (SIL OFL, fuentes/) parecida a la Comic Sans de algunas
+# fábricas, que no se puede incrustar.
+_FUENTES = Path(__file__).resolve().with_name("fuentes")
+FAMILIAS: dict[str, tuple[tuple[fitz.Font, str], tuple[fitz.Font, str]]] = {
+    "helvetica": ((FONT_REG, FONT_REG_NAME), (FONT, FONT_NAME)),
+}
+if (_FUENTES / "ComicNeue-Regular.ttf").exists():
+    FAMILIAS["comic-neue"] = ((fitz.Font(fontfile=str(_FUENTES / "ComicNeue-Regular.ttf")), "ComicReg"),
+                              (fitz.Font(fontfile=str(_FUENTES / "ComicNeue-Bold.ttf")), "ComicBold"))
+
+
+def fuente_de(familia: str, negrita: bool) -> tuple[fitz.Font, str]:
+    return FAMILIAS[familia][1 if negrita else 0]
+
+
+def insertar_fuentes(page: fitz.Page, familia: str) -> None:
+    for f, nombre in FAMILIAS[familia]:
+        page.insert_font(fontname=nombre, fontbuffer=f.buffer)
 
 
 def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
@@ -100,6 +120,10 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
                 raise ValueError("totales_columnas necesita iva_pct o iva_titulo (uno de los dos)")
         if con is not None and con.get("totales_fijos") and con.get("en_tabla"):
             raise ValueError("conceptos: totales_fijos y en_tabla no van juntos")
+        if con is not None and con.get("filas", "lineas") not in ("lineas", "bandas"):
+            raise ValueError("conceptos.filas: lineas o bandas")
+        if raw.get("fuente", "helvetica") not in FAMILIAS:
+            raise ValueError(f"fuente no disponible: {raw.get('fuente')}")
         return T | {
             "id": f"{raw['id']}-v{raw['version']}",
             "huella": raw["huella"],
@@ -124,6 +148,10 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             "conceptos": None if con is None else {
                 "ancla": con["ancla"], "totales_fijos": bool(con.get("totales_fijos", False)),
                 "en_tabla": bool(con.get("en_tabla", False)),
+                # "lineas": filas separadas por líneas (la fila vacía de cierre baja); "bandas": sin líneas, a
+                # continuación del último texto, con la banda gris alterna de las filas con precio.
+                "filas": con.get("filas", "lineas"),
+                "col_uds": con.get("col_uds"),  # título de la columna de uds. si la tabla no lo define
                 "caja": None if con.get("totales_fijos") or con.get("en_tabla")
                 else tuple(float(v) for v in con["caja"]),
                 "importe_dx": None if "importe_dx" not in con else float(con["importe_dx"]),
@@ -134,6 +162,7 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
             "precio": re.compile(raw["precio"]),
             # Opcional: los importes reescritos van en normal o en negrita como el original (si no, en negrita).
             "grosor_original": bool(raw.get("grosor_original", False)),
+            "fuente": raw.get("fuente", "helvetica"),
             "logo_pagina": logo["pagina"] - 1,
             "zona_logo_fabrica": tuple(logo["rect"]),  # x0, y0, x1, y1
             "lista_negra": red["lista_negra"],
@@ -771,6 +800,7 @@ class FilaTabla:
     importe: str
     y0: float  # borde superior de la fila
     y1: float  # borde inferior
+    banda: list[tuple] = field(default_factory=list)  # celdas de la banda gris (modo bandas), si le toca
 
 
 @dataclass
@@ -787,12 +817,16 @@ class TablaConceptos:
     interlinea: float
     x_desc: float  # borde izquierdo de la descripción
     x_uds: float  # borde derecho de las uds.
-    x_precio_centro: float  # el precio va centrado en su columna, como en el original
+    x_precio: float  # centro del precio o, si en el original van alineados a la derecha, su borde derecho
     x_importe: float  # borde derecho del importe
     size: float
     color: int
     negrita: bool
     grosor: float  # de las líneas originales (0 = la más fina que pinte el dispositivo)
+    familia: str = "helvetica"
+    precio_derecha: bool = False
+    lineas: bool = True  # filas separadas por líneas; si no, bandas (relleno) en las filas que toque
+    relleno: tuple | None = None
 
 
 @dataclass
@@ -958,6 +992,117 @@ def _fila_modelo(doc: fitz.Document, ex: Extraccion, pagina_totales: int, x0: fl
     return None
 
 
+def _columna_precio(ex: Extraccion, modelo: Linea, fuente: fitz.Font, size: float) -> tuple[bool, float]:
+    """¿Los precios del original van alineados a la derecha (mismo borde derecho)? Si no, centrados en su columna.
+    Devuelve eso y el borde derecho o el centro, medidos en la fila modelo."""
+    derechas = [ln.rect_importe[2] for ln in ex.lineas if ln.tipo != "descuento"]
+    if len(derechas) >= 2 and max(derechas) - min(derechas) <= 1:
+        return True, modelo.rect_importe[2]
+    texto = modelo.precio.strip() if modelo.precio else modelo.importe
+    return False, modelo.rect_importe[2] - fuente.text_length(texto, fontsize=size) / 2
+
+
+def _filas_texto(conceptos: list[Concepto], fuente: fitz.Font, size: float, ancho: float
+                 ) -> tuple[list[list[str]], list[str]]:
+    """Descripción de cada concepto partida en 1–2 líneas que quepan en la columna; errores "conceptos:"."""
+    err: list[str] = []
+    out: list[list[str]] = []
+    for c in conceptos:
+        texto = " ".join(c.texto.split())
+        raros = sorted({ch for ch in texto if not fuente.has_glyph(ord(ch))})
+        if not texto:
+            err.append("conceptos: hay una línea sin texto")
+            continue
+        if raros:
+            err.append(f"conceptos: «{texto[:30]}» lleva caracteres no admitidos {raros}")
+            continue
+        lineas = envolver(texto, ancho, size, fuente)
+        if len(lineas) > 2 or any(fuente.text_length(l, fontsize=size) > ancho for l in lineas):
+            err.append(f"conceptos: «{texto[:30]}…» es demasiado largo; acórtalo")
+            continue
+        out.append(lineas)
+    return out, err
+
+
+def _plan_bandas(doc: fitz.Document, ex: Extraccion, T: dict, conceptos: list[Concepto], n: int,
+                 caja: fitz.Rect, tabla: fitz.Rect, dibujos: list[dict]) -> tuple[BloqueConceptos | None, list[str]]:
+    """Tabla sin líneas entre filas: las filas nuevas van a continuación del último texto de la tabla, con el
+    paso entre líneas de la descripción, la letra de la última fila de la fábrica y la banda gris alterna de las
+    filas con precio (la primera, al revés que la última de la fábrica)."""
+    C, TB = T["conceptos"], T["tabla"]
+    page = doc[n]
+    lineas_fab = [ln for ln in ex.lineas if ln.tipo != "descuento"]
+    modelo = ([ln for ln in lineas_fab if ln.pagina == n] or lineas_fab)[-1]
+    size, negrita = modelo.size, modelo.negrita_total
+    fuente = fuente_de(T["fuente"], negrita)[0]
+    spans = page_spans(page)
+    titulo_uds = C["col_uds"] or TB["col_uds"]
+    cab_uds = next((sp for sp in spans if titulo_uds and sp.text.strip() == titulo_uds), None)
+    cab_desc = next((sp for sp in spans if sp.text.strip() == TB["col_descripcion"]), None)
+    uds = [sp.bbox[2] for sp in spans if cab_uds is not None and UDS.match(sp.text)
+           and abs(sp.bbox[2] - cab_uds.bbox[2]) <= TB["tol_x"] and cab_uds.bbox[3] < sp.bbox[1] < caja.y0]
+    if cab_desc is None or cab_uds is None:
+        return None, ["conceptos: no se encuentran las columnas de descripción o de uds. de la tabla"]
+    # Uds. alineadas a la derecha como las de la fábrica; sin ninguna en la página, en el borde del título.
+    x_uds = sorted(uds)[len(uds) // 2] if uds else cab_uds.bbox[2]
+    dentro = [sp for sp in spans if tabla.x0 < sp.bbox[0] < tabla.x1 and tabla.y0 < sp.bbox[1] and sp.bbox[3] < caja.y0 - 1]
+    x_desc = min((sp.bbox[0] for sp in dentro if abs(sp.bbox[0] - cab_desc.bbox[0]) <= 5), default=cab_desc.bbox[0])
+    tops = sorted({round(sp.bbox[1], 1) for sp in dentro if abs(sp.bbox[0] - x_desc) <= 2})
+    pasos = [b - a for a, b in zip(tops, tops[1:]) if b - a >= size]
+    if not pasos or not dentro:
+        return None, ["conceptos: no se reconocen las filas de la tabla"]
+    paso = min(pasos)
+    columnas = sorted({a.x for a, b, _ in _segmentos(dibujos) if abs(a.x - b.x) < 0.5 and abs(a.y - b.y) > 5
+                       and tabla.x0 + 1 < a.x < tabla.x1 - 1 and max(a.y, b.y) >= caja.y0 - 2})
+    izquierda = [x for x in columnas if x < x_uds - 10]
+    ancho = (izquierda[-1] if izquierda else cab_uds.bbox[0]) - 3 - x_desc
+    textos, err = _filas_texto(conceptos, fuente, size, ancho)
+    if err:
+        return None, err
+    precio_derecha, x_precio = _columna_precio(ex, modelo, fuente, size)
+
+    # Banda gris de las filas con precio: celdas, desfase respecto al texto de la fila y color.
+    def celdas_de(p: int, ln: Linea) -> list[fitz.Rect]:
+        return [fitz.Rect(d["rect"]) for d in doc[p].get_drawings() if d.get("fill") is not None
+                and d["rect"].height < size * 2 and d["rect"].width < tabla.width * 0.9
+                and d["rect"].y0 < ln.rect_total[3] and d["rect"].y1 > ln.rect_total[1]]
+    muestra = next(((ln, c) for ln in reversed(lineas_fab) if (c := celdas_de(ln.pagina, ln))), None)
+    relleno = None
+    if muestra is not None:
+        ln_m, cs = muestra
+        relleno = next(d.get("fill") for d in doc[ln_m.pagina].get_drawings()
+                       if d.get("fill") is not None and _parecido(fitz.Rect(d["rect"]), cs[0], 0.1))
+        dy_banda = cs[0].y0 - ln_m.rect_total[1]
+        alto_banda = cs[0].height
+        xs = sorted((c.x0, c.x1) for c in cs)
+    sombreada = bool(celdas_de(modelo.pagina, modelo))
+
+    top = max(sp.bbox[1] for sp in dentro) + paso  # parte de arriba del texto de la primera fila nueva
+    base = modelo.origin_total[1] - modelo.rect_total[1]  # línea base desde la parte de arriba del texto
+    filas: list[FilaTabla] = []
+    for i, (c, lineas) in enumerate(zip(conceptos, textos)):
+        banda = []
+        if relleno is not None and (i % 2 == 0) != sombreada:
+            banda = [(x0, top + dy_banda, x1, top + dy_banda + alto_banda) for x0, x1 in xs]
+        filas.append(FilaTabla(lineas, str(c.uds), fmt_eur(c.precio_ud), fmt_eur(c.importe), top - 1,
+                               top + paso * len(lineas) - 1, banda))
+        top += paso * len(lineas)
+    inicio, fondo = filas[0].y0 - 0.5, filas[-1].y1
+    zona = fitz.Rect(tabla.x0 + 1, inicio, tabla.x1 - 1, fondo)
+    # Libre salvo el marco (lo contiene todo) y las líneas de columna (la atraviesan de arriba abajo).
+    cosas = [fitz.Rect(w[:4]) for w in page.get_text("words") if w[4].strip()] + \
+        [fitz.Rect(i["bbox"]) for i in page.get_image_info()] + \
+        [pad(tuple(d["rect"])) for d in dibujos if not pad(tuple(d["rect"]), 1).contains(zona)
+         and not (d["rect"].width < 1 and d["rect"].y0 <= zona.y0 and d["rect"].y1 >= zona.y1)]
+    if fondo > caja.y0 - 1 or any(c.intersects(zona) for c in cosas):
+        return None, [f"conceptos: no caben {len(conceptos)} líneas añadidas en la tabla; quita alguna o júntalas"]
+    tc = TablaConceptos(tabla.x0, tabla.x1, [], fondo, None, 0.0, filas, base + 1, paso, x_desc, x_uds, x_precio,
+                        modelo.rect_total[2], size, modelo.color, negrita, 0.0, T["fuente"], precio_derecha,
+                        lineas=False, relleno=relleno)
+    return BloqueConceptos(n, caja, fitz.Rect(tabla.x0, inicio, tabla.x1, fondo), 0.0, size, modelo.color,
+                           (0, 0, 0), TRAZO_FINO, modelo.rect_total[2], 0.0, [], tabla=tc), []
+
+
 def plan_conceptos_tabla(pdf: bytes, ex: Extraccion, T: dict, conceptos: list[Concepto]
                          ) -> tuple[BloqueConceptos | None, list[str]]:
     """Conceptos como filas de la tabla de productos, debajo de la última fila de la página de totales: mide
@@ -984,6 +1129,8 @@ def plan_conceptos_tabla(pdf: bytes, ex: Extraccion, T: dict, conceptos: list[Co
                       and d["rect"].width > page.rect.width * 0.7 and d["rect"].y0 < ultima.rect_total[1]), None)
         if tabla is None:
             return None, ["conceptos: no se encuentra el marco de la tabla en el PDF"]
+        if C["filas"] == "bandas":
+            return _plan_bandas(doc, ex, T, conceptos, n, caja, tabla, dibujos)
         segs = _segmentos(dibujos)
         verticales = [(a.x, max(a.y, b.y)) for a, b, _ in segs if abs(a.x - b.x) < 0.5 and abs(a.y - b.y) > 5
                       and tabla.x0 + 1 < a.x < tabla.x1 - 1 and max(a.y, b.y) < caja.y0 - 1]
@@ -1009,7 +1156,8 @@ def plan_conceptos_tabla(pdf: bytes, ex: Extraccion, T: dict, conceptos: list[Co
         modelo, alto_fila, baseline = ref
         size = modelo.size
         spans = page_spans(page)
-        cab_uds = next((sp for sp in spans if TB["col_uds"] and sp.text.strip() == TB["col_uds"]), None)
+        titulo_uds = C["col_uds"] or TB["col_uds"]
+        cab_uds = next((sp for sp in spans if titulo_uds and sp.text.strip() == titulo_uds), None)
         cab_desc = next((sp for sp in spans if sp.text.strip() == TB["col_descripcion"]), None)
         uds = [sp.bbox[2] for sp in spans if cab_uds is not None and UDS.match(sp.text)
                and abs(sp.bbox[2] - cab_uds.bbox[2]) <= TB["tol_x"] and cab_uds.bbox[3] < sp.bbox[1] < caja.y0]
@@ -1024,32 +1172,19 @@ def plan_conceptos_tabla(pdf: bytes, ex: Extraccion, T: dict, conceptos: list[Co
             return None, ["conceptos: no se encuentran las columnas de la tabla"]
         ancho = izquierda[-1] - 3 - x_desc
         negrita = modelo.negrita_total
-        fuente = FONT if negrita else FONT_REG
-        x_precio_centro = modelo.rect_importe[2] - fuente.text_length(modelo.precio.strip() if modelo.precio
-                                                                      else modelo.importe, fontsize=size) / 2
+        fuente = fuente_de(T["fuente"], negrita)[0]
+        precio_derecha, x_precio = _columna_precio(ex, modelo, fuente, size)
         interlinea = size * INTERLINEA_FILA
 
-        err: list[str] = []
+        textos, err = _filas_texto(conceptos, fuente, size, ancho)
+        if err:
+            return None, err
         filas: list[FilaTabla] = []
         y = y_inicio
-        for c in conceptos:
-            texto = " ".join(c.texto.split())
-            raros = sorted({ch for ch in texto if not fuente.has_glyph(ord(ch))})
-            if not texto:
-                err.append("conceptos: hay una línea sin texto")
-                continue
-            if raros:
-                err.append(f"conceptos: «{texto[:30]}» lleva caracteres no admitidos {raros}")
-                continue
-            lineas = envolver(texto, ancho, size, fuente)
-            if len(lineas) > 2 or any(fuente.text_length(l, fontsize=size) > ancho for l in lineas):
-                err.append(f"conceptos: «{texto[:30]}…» es demasiado largo; acórtalo")
-                continue
+        for c, lineas in zip(conceptos, textos):
             alto = alto_fila + interlinea * (len(lineas) - 1)
             filas.append(FilaTabla(lineas, str(c.uds), fmt_eur(c.precio_ud), fmt_eur(c.importe), y, y + alto))
             y += alto
-        if err:
-            return None, err
         fondo = y + alto_cierre
         # Lo que ocuparán las filas por debajo de donde acaban hoy las columnas tiene que estar libre (salvo el
         # marco de la tabla, que lo contiene todo).
@@ -1062,8 +1197,8 @@ def plan_conceptos_tabla(pdf: bytes, ex: Extraccion, T: dict, conceptos: list[Co
         trazo = ref[3].get("color") or (0, 0, 0)
         ancho_trazo = ref[3].get("width")
         tc = TablaConceptos(ref[1], ref[2], columnas, y_columnas, y_cierre, alto_cierre, filas, baseline, interlinea,
-                            x_desc, x_uds, x_precio_centro, modelo.rect_total[2], size, modelo.color, negrita,
-                            1.0 if ancho_trazo is None else ancho_trazo)
+                            x_desc, x_uds, x_precio, modelo.rect_total[2], size, modelo.color, negrita,
+                            1.0 if ancho_trazo is None else ancho_trazo, T["fuente"], precio_derecha)
     return BloqueConceptos(n, caja, fitz.Rect(tabla.x0, y_inicio, tabla.x1, fondo), 0.0, size, modelo.color,
                            tuple(trazo), 1.0 if ancho_trazo is None else (ancho_trazo or TRAZO_FINO),
                            modelo.rect_total[2], 0.0, [], tabla=tc), []
@@ -1079,7 +1214,20 @@ def stamp_conceptos_tabla(page: fitz.Page, b: BloqueConceptos) -> None:
                               text=fitz.PDF_REDACT_TEXT_NONE)
         page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
         page.insert_font(fontname=FONT_REG_NAME, fontbuffer=FONT_REG.buffer)
+        insertar_fuentes(page, t.familia)
     fondo = b.bloque.y1
+    for f in t.filas:
+        for r in f.banda:
+            page.draw_rect(fitz.Rect(r), color=None, fill=t.relleno, width=0)
+    if t.lineas:
+        _lineas_tabla(page, b, fondo)
+    nombre_fuente = fuente_de(t.familia, t.negrita)
+    _textos_tabla(page, t, nombre_fuente)
+
+
+def _lineas_tabla(page: fitz.Page, b: BloqueConceptos, fondo: float) -> None:
+    """Separador de cada fila nueva, línea de la fila de cierre y columnas alargadas, con el grosor original."""
+    t = b.tabla
     sh = page.new_shape()
     for y in [f.y1 for f in t.filas] + ([fondo] if t.alto_cierre else []):
         sh.draw_line((t.x0, y), (t.x1, y))
@@ -1092,16 +1240,23 @@ def stamp_conceptos_tabla(page: fitz.Page, b: BloqueConceptos) -> None:
     else:
         sh.finish(color=b.trazo, width=t.grosor)
     sh.commit()
-    nombre, fuente = (FONT_NAME, FONT) if t.negrita else (FONT_REG_NAME, FONT_REG)
+
+
+def _textos_tabla(page: fitz.Page, t: TablaConceptos, nombre_fuente: tuple[fitz.Font, str]) -> None:
+    """Descripción, uds., precio e importe de cada fila nueva, con la letra y la alineación de la tabla."""
+    fuente, nombre = nombre_fuente
     rgb = tuple(((t.color >> s) & 0xFF) / 255 for s in (16, 8, 0))
     for f in t.filas:
         y = f.y0 + t.baseline
         for i, linea in enumerate(f.lineas):
             page.insert_text((t.x_desc, y + i * t.interlinea), linea, fontname=nombre, fontsize=t.size, color=rgb)
-        stamp_right(page, f.uds, t.x_uds, y, t.size, t.color, regular=not t.negrita)
-        page.insert_text((t.x_precio_centro - fuente.text_length(f.precio, fontsize=t.size) / 2, y), f.precio,
-                         fontname=nombre, fontsize=t.size, color=rgb)
-        stamp_right(page, f.importe, t.x_importe, y, t.size, t.color, regular=not t.negrita)
+        stamp_right(page, f.uds, t.x_uds, y, t.size, t.color, regular=not t.negrita, familia=t.familia)
+        if t.precio_derecha:
+            stamp_right(page, f.precio, t.x_precio, y, t.size, t.color, regular=not t.negrita, familia=t.familia)
+        else:
+            page.insert_text((t.x_precio - fuente.text_length(f.precio, fontsize=t.size) / 2, y), f.precio,
+                             fontname=nombre, fontsize=t.size, color=rgb)
+        stamp_right(page, f.importe, t.x_importe, y, t.size, t.color, regular=not t.negrita, familia=t.familia)
 
 
 def verify_conceptos_tabla(doc: fitz.Document, b: BloqueConceptos) -> list[str]:
@@ -1307,9 +1462,9 @@ def calcular(ex: Extraccion, pct: Decimal, modo: str, montaje: Decimal | None,
 
 
 def stamp_right(page: fitz.Page, text: str, x1: float, y: float, size: float, color: int,
-                regular: bool = False) -> None:
+                regular: bool = False, familia: str = "helvetica") -> None:
     """Texto alineado a la derecha en x1. regular: fuente normal (ya insertada en la página), p. ej. un título."""
-    font, nombre = (FONT_REG, FONT_REG_NAME) if regular else (FONT, FONT_NAME)
+    font, nombre = fuente_de(familia, not regular)
     w = font.text_length(text, fontsize=size)
     rgb = tuple(((color >> s) & 0xFF) / 255 for s in (16, 8, 0))
     page.insert_text((x1 - w, y), text, fontname=nombre, fontsize=size, color=rgb)
@@ -1365,6 +1520,8 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
     doc = fitz.open(stream=pdf, filetype="pdf")
     labels = {"Base Imponible": "Base Imponible", "Total": "Total", "TOTAL": "TOTAL"}
 
+    fam = T["fuente"]
+
     def normal(negrita: bool) -> bool:
         """¿Se estampa en letra normal? Solo si la plantilla lo pide y el original no iba en negrita."""
         return T["grosor_original"] and not negrita
@@ -1413,11 +1570,13 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
                                   text=fitz.PDF_REDACT_TEXT_REMOVE)
         page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
         page.insert_font(fontname=FONT_REG_NAME, fontbuffer=FONT_REG.buffer)
+        insertar_fuentes(page, fam)
         dy = 0.0
         if bc is not None and bc.pagina == n and bc.mover is not None:
             mover_contenido(doc, page, bc.mover, bc.desplazamiento)
             page.insert_font(fontname=FONT_NAME, fontbuffer=FONT.buffer)
             page.insert_font(fontname=FONT_REG_NAME, fontbuffer=FONT_REG.buffer)
+            insertar_fuentes(page, fam)
         if pc is not None and pc.pagina == n:
             stamp_condiciones(page, pc)
         if bc is not None and bc.pagina == n:
@@ -1430,18 +1589,18 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
             # Modo tabla: en la columna de precio, el precio por unidad de medida (total / cantidad).
             unit = nuevo["importe"] if ln.cantidad is None else (nuevo["total"] / ln.cantidad).quantize(CENT, ROUND_HALF_UP)
             stamp_right(page, fmt_eur(unit), ln.rect_importe[2], ln.origin_importe[1], ln.size, ln.color,
-                        regular=normal(ln.negrita_importe))
+                        regular=normal(ln.negrita_importe), familia=fam)
             stamp_right(page, fmt_eur(nuevo["total"]), ln.rect_total[2], ln.origin_total[1], ln.size, ln.color,
-                        regular=normal(ln.negrita_total))
+                        regular=normal(ln.negrita_total), familia=fam)
         for st, valor in zip(ex.subtotales, calc["subtotales"]):
             if st.pagina == n:
                 stamp_right(page, fmt_eur(valor), st.rect[2], st.origin[1], st.size, st.color,
-                            regular=normal(st.negrita))
+                            regular=normal(st.negrita), familia=fam)
         for t in (t for t in ex.totales if t.pagina == n):
             if t.solo_valor:
                 valor = {"IVA": calc["iva"], "TOTAL": calc["total"]}.get(t.label, calc["base"])
                 stamp_right(page, fmt_eur(valor) + t.sufijo, t.rect[2], t.origin[1] + dy, t.size, t.color,
-                            regular=normal(t.negrita))
+                            regular=normal(t.negrita), familia=fam)
                 if t.pct_rect is not None:
                     pct = fmt_pct(calc["iva_pct"], t.iva_pct)
                     if t.pct_marco is not None:  # % dentro del título de la columna: el título entero, en normal
@@ -1450,14 +1609,15 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
                                     t.pct_origin[1] + dy, t.size, t.color, regular=True)
                     else:
                         stamp_right(page, pct, t.pct_rect[2], t.pct_origin[1] + dy, t.size, t.color,
-                                    regular=normal(t.negrita))
+                                    regular=normal(t.negrita), familia=fam)
                 continue
             if t.label == "IVA":
                 txt = f"I.V.A {fmt_pct(calc['iva_pct'], t.iva_pct)} % : {fmt_eur(calc['iva'])} €"
             else:
                 valor = calc["total"] if t.label == "TOTAL" else calc["base"]
                 txt = f"{labels[t.label]}: {fmt_eur(valor)} €"
-            stamp_right(page, txt, t.rect[2], t.origin[1] + dy, t.size, t.color, regular=normal(t.negrita))
+            stamp_right(page, txt, t.rect[2], t.origin[1] + dy, t.size, t.color, regular=normal(t.negrita),
+                        familia=fam)
 
         if marca is not None and not marca.vacia:
             M = T["marca"]
