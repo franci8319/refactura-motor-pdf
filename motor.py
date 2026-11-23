@@ -333,7 +333,7 @@ class Marca:
 
 MAX_LADO_LOGO = 4000  # px; se comprueba en la cabecera antes de decodificar
 TAM_DATOS = (9.0, 6.0)  # pt máx. y mín.: el texto se reduce hasta caber en su zona
-TAM_PIE = (7.0, 5.5)
+TAM_PIE = (7.0, 5.5)  # el pie va en letra normal (FONT_REG), centrado en la página
 TAM_RECUADRO = (10.0, 6.0)  # la primera línea, en negrita; el resto, en normal
 INTERLINEA = 1.3
 
@@ -790,14 +790,14 @@ def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> li
                 logo_pixmap(marca.logo)
             except (RuntimeError, ValueError):
                 err.append("marca: el logo no se puede leer")
-    for nombre, lineas, zona, tams in (("datos", marca.datos, M["zona_datos"], TAM_DATOS),
-                                       ("pie", marca.pie, M["zona_pie"], TAM_PIE)):
+    for nombre, lineas, zona, tams, fuente in (("datos", marca.datos, M["zona_datos"], TAM_DATOS, FONT),
+                                               ("pie", marca.pie, M["zona_pie"], TAM_PIE, FONT_REG)):
         if not lineas:
             continue
-        raros = sorted({c for l in lineas for c in l if not FONT.has_glyph(ord(c))})
+        raros = sorted({c for l in lineas for c in l if not fuente.has_glyph(ord(c))})
         if raros:
             err.append(f"marca: {nombre} con caracteres no admitidos {raros}")
-        elif tam_texto(lineas, zona, tams) is None:
+        elif tam_texto(lineas, zona, tams, [fuente] * len(lineas)) is None:
             err.append(f"marca: el texto de {nombre} no cabe; acórtalo")
     if marca.recuadro and M["recuadro"] is not None:
         fuentes = fuentes_recuadro(marca.recuadro)
@@ -1362,7 +1362,7 @@ def stamp_conceptos(page: fitz.Page, b: BloqueConceptos) -> None:
 def pie_de_datos(datos: list[str], zona: tuple) -> list[str]:
     """Datos de empresa como pie: en una línea si caben; si no, repartidos en dos."""
     una = [" · ".join(datos)]
-    if len(datos) < 2 or tam_texto(una, zona, TAM_PIE) is not None:
+    if len(datos) < 2 or tam_texto(una, zona, TAM_PIE, [FONT_REG]) is not None:
         return una
     corte = min(range(1, len(datos)), key=lambda i: abs(len(" · ".join(datos[:i])) - len(" · ".join(datos[i:]))))
     return [" · ".join(datos[:corte]), " · ".join(datos[corte:])]
@@ -1525,21 +1525,27 @@ def pad(r: tuple, d: float = 0.5) -> fitz.Rect:
 
 
 def stamp_bloque(page: fitz.Page, lineas: list[str], zona: tuple, tams: tuple[float, float],
-                 derecha: bool, primera_negrita: bool = False) -> None:
+                 derecha: bool, primera_negrita: bool = False, pie: bool = False) -> None:
     """Líneas centradas en vertical en la zona, alineadas a la izquierda o a la derecha.
-    primera_negrita: solo la primera en negrita y el resto en normal (si no, todas en negrita)."""
+    primera_negrita: solo la primera en negrita y el resto en normal (si no, todas en negrita).
+    pie: todas en normal y centradas en la página (sin salirse de la zona, que no siempre está centrada)."""
     z = fitz.Rect(zona)
-    fuentes = fuentes_recuadro(lineas) if primera_negrita else None
+    fuentes = fuentes_recuadro(lineas) if primera_negrita else [FONT_REG] * len(lineas) if pie else None
     t = tam_texto(lineas, zona, tams, fuentes)
     assert t is not None  # validate_marca ya lo comprobó
     paso = t * INTERLINEA
     y = z.y0 + (z.height - paso * len(lineas)) / 2 + t
     for i, linea in enumerate(lineas):
-        nombre = FONT_REG_NAME if primera_negrita and i else FONT_NAME
+        normal = pie or (primera_negrita and i)
+        fuente, nombre = (FONT_REG, FONT_REG_NAME) if normal else (FONT, FONT_NAME)
         if derecha:
             stamp_right(page, linea, z.x1, y, t, 0)
         else:
-            page.insert_text((z.x0, y), linea, fontname=nombre, fontsize=t, color=(0, 0, 0))
+            x = z.x0
+            if pie:
+                ancho = fuente.text_length(linea, fontsize=t)
+                x = min(max(page.rect.width / 2 - ancho / 2, z.x0), z.x1 - ancho)
+            page.insert_text((x, y), linea, fontname=nombre, fontsize=t, color=(0, 0, 0))
         y += paso
 
 
@@ -1684,7 +1690,7 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
             if marca.datos and n == M["datos_pagina"]:
                 stamp_bloque(page, marca.datos, M["zona_datos"], TAM_DATOS, derecha=True)
             if marca.pie:
-                stamp_bloque(page, marca.pie, M["zona_pie"], TAM_PIE, derecha=False)
+                stamp_bloque(page, marca.pie, M["zona_pie"], TAM_PIE, derecha=False, pie=True)
             if marca.recuadro and n in recuadros:
                 stamp_bloque(page, marca.recuadro, zona_texto_recuadro(recuadros[n], T), TAM_RECUADRO,
                              derecha=False, primera_negrita=True)

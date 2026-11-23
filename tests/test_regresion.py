@@ -68,3 +68,25 @@ def test_precios_conservan_el_grosor(pdf):
     distintos = [(p + 1, tuple(round(v) for v in ro)) for p, ro, rs in pares
                  if (_negrita(orig, p, ro) if T["grosor_original"] else True) != _negrita(out, p, rs)]
     assert not distintos, f"grosor distinto al original en {distintos[:5]} (de {len(distintos)})"
+
+
+@pytest.mark.parametrize("pdf", PDFS, ids=IDS)
+def test_pie_del_montador_centrado_y_en_letra_normal(pdf):
+    """En todas las plantillas, el pie del montador va en letra normal y centrado en la página, sin salirse de
+    su zona (que no siempre está centrada)."""
+    T = reconocen(pdf)[0]
+    if T["marca"] is None:
+        pytest.skip("plantilla sin zonas de marca")
+    g = motor.generar(pdf.read_bytes(), T, Decimal(30), marca=motor.Marca(pie=MARCA["pie"]))
+    assert g.ok, g.datos["errores"]
+    zona = motor.pad(T["marca"]["zona_pie"], 1)
+    with fitz.open(stream=g.pdf, filetype="pdf") as out:
+        for page in out:
+            spans = [s for b in page.get_text("dict", clip=zona)["blocks"] for l in b.get("lines", [])
+                     for s in l["spans"] if s["text"].strip() == MARCA["pie"][0]]
+            assert len(spans) == 1, f"p{page.number + 1}: pie no encontrado"
+            s, r = spans[0], fitz.Rect(spans[0]["bbox"])
+            assert not s["flags"] & 16 and "Bold" not in s["font"], f"p{page.number + 1}: pie en negrita ({s['font']})"
+            assert zona.contains(r)
+            centrado = abs((r.x0 + r.x1) / 2 - page.rect.width / 2) <= 1
+            assert centrado or r.x0 <= zona.x0 + 1 or r.x1 >= zona.x1 - 1, f"p{page.number + 1}: pie sin centrar"
