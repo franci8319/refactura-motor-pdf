@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_HALF_UP, Decimal
 
 import pymupdf as fitz
@@ -187,6 +187,13 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
                 "pie_por_defecto": pie_defecto,
                 # false: la cabecera de fábrica ocupa el hueco del logo; conservándola no cabe el del montador.
                 "logo_con_fabrica": bool(marca.get("logo_con_fabrica", True)),
+                # Opcional: recuadro con los datos del propio montador (no del cliente final), que puede
+                # sustituir por su texto. Zona relativa a un ancla de texto, en cada página que la tenga.
+                "recuadro": None if "recuadro" not in marca else {
+                    "ancla": marca["recuadro"]["ancla"],
+                    "zona": tuple(marca["recuadro"]["zona"]),  # dx0, dy0, dx1, dy1 desde la esquina del ancla
+                    "sangria": float(marca["recuadro"].get("sangria", 0)),  # pt desde el borde izquierdo
+                },
             },
         }
     except (KeyError, TypeError, re.error) as e:
@@ -312,20 +319,22 @@ class Marca:
     datos: list[str] = field(default_factory=list)
     pie: list[str] = field(default_factory=list)
     condiciones: str | None = None  # sustituye el texto de condiciones de la fábrica (si el PDF lo trae)
+    recuadro: list[str] = field(default_factory=list)  # sustituye el texto del recuadro con los datos del montador
 
     @property
     def vacia(self) -> bool:
-        return not (self.logo or self.datos or self.pie or self.condiciones)
+        return not (self.logo or self.datos or self.pie or self.condiciones or self.recuadro)
 
     @property
     def visual(self) -> bool:
-        """Lo que va en zonas fijas de la plantilla (cabecera y pie)."""
-        return bool(self.logo or self.datos or self.pie)
+        """Lo que va en zonas de la plantilla (cabecera, recuadro y pie)."""
+        return bool(self.logo or self.datos or self.pie or self.recuadro)
 
 
 MAX_LADO_LOGO = 4000  # px; se comprueba en la cabecera antes de decodificar
 TAM_DATOS = (9.0, 6.0)  # pt máx. y mín.: el texto se reduce hasta caber en su zona
 TAM_PIE = (7.0, 5.5)
+TAM_RECUADRO = (10.0, 6.0)  # la primera línea, en negrita; el resto, en normal
 INTERLINEA = 1.3
 
 
@@ -716,16 +725,44 @@ def plantilla_efectiva(T: dict, conservar_fabrica: bool) -> dict:
     return {**T, "marca": {**M, "logo_pagina": pagina, "zona_logo": zona, "logo_derecha": True}}
 
 
-def tam_texto(lineas: list[str], zona: tuple, tams: tuple[float, float]) -> float | None:
-    """Mayor tamaño (en pasos de 0,25 pt) con el que todas las líneas caben en la zona; None si no caben."""
+def tam_texto(lineas: list[str], zona: tuple, tams: tuple[float, float],
+              fuentes: list[fitz.Font] | None = None) -> float | None:
+    """Mayor tamaño (en pasos de 0,25 pt) con el que todas las líneas caben en la zona; None si no caben.
+    fuentes: la de cada línea (por defecto, todas en negrita)."""
     z = fitz.Rect(zona)
+    fuentes = fuentes or [FONT] * len(lineas)
     t = tams[0]
     while t >= tams[1]:
         if len(lineas) * t * INTERLINEA <= z.height and \
-                max(FONT.text_length(l, fontsize=t) for l in lineas) <= z.width:
+                max(f.text_length(l, fontsize=t) for l, f in zip(lineas, fuentes)) <= z.width:
             return t
         t -= 0.25
     return None
+
+
+def fuentes_recuadro(lineas: list[str]) -> list[fitz.Font]:
+    return [FONT] + [FONT_REG] * (len(lineas) - 1)
+
+
+def zona_texto_recuadro(zona: fitz.Rect, T: dict) -> tuple:
+    return (zona.x0 + T["marca"]["recuadro"]["sangria"], zona.y0, zona.x1, zona.y1)
+
+
+def zona_recuadro(page: fitz.Page, T: dict) -> fitz.Rect | None:
+    """Recuadro del montador en esta página (relativo a su ancla), o None si la página no lo tiene."""
+    R = (T["marca"] or {}).get("recuadro")
+    if R is None:
+        return None
+    hits = page.search_for(R["ancla"])
+    if not hits:
+        return None
+    a, (z0, z1, z2, z3) = hits[0], R["zona"]
+    return fitz.Rect(a.x0 + z0, a.y0 + z1, a.x0 + z2, a.y0 + z3) & page.rect
+
+
+def zonas_recuadro(pdf: bytes, T: dict) -> dict[int, fitz.Rect]:
+    with fitz.open(stream=pdf, filetype="pdf") as doc:
+        return {p.number: z for p in doc if (z := zona_recuadro(p, T)) is not None}
 
 
 def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> list[str]:
@@ -762,6 +799,15 @@ def validate_marca(marca: Marca, T: dict, conservar_fabrica: bool = False) -> li
             err.append(f"marca: {nombre} con caracteres no admitidos {raros}")
         elif tam_texto(lineas, zona, tams) is None:
             err.append(f"marca: el texto de {nombre} no cabe; acórtalo")
+    if marca.recuadro and M["recuadro"] is not None:
+        fuentes = fuentes_recuadro(marca.recuadro)
+        raros = sorted({c for l, f in zip(marca.recuadro, fuentes) for c in l if not f.has_glyph(ord(c))})
+        z0, z1, z2, z3 = M["recuadro"]["zona"]
+        ancho = (z2 - z0 - M["recuadro"]["sangria"], z3 - z1)
+        if raros:
+            err.append(f"marca: el texto del recuadro lleva caracteres no admitidos {raros}")
+        elif tam_texto(marca.recuadro, (0, 0, *ancho), TAM_RECUADRO, fuentes) is None:
+            err.append("marca: el texto del recuadro no cabe; acórtalo o quita alguna línea")
     return err
 
 
@@ -1323,11 +1369,15 @@ def pie_de_datos(datos: list[str], zona: tuple) -> list[str]:
 
 
 def marca_efectiva(marca: Marca, T: dict, conservar_fabrica: bool) -> Marca:
-    """Aplica pie_por_defecto: si la plantilla lo pide y el montador no tiene pie, sus datos van al pie."""
+    """Aplica pie_por_defecto: si la plantilla lo pide y el montador no tiene pie, sus datos van al pie.
+    El texto del recuadro solo se usa en formatos que lo definen (en los demás, el recuadro es del cliente
+    final o no existe): donde no, se ignora, como las condiciones en los PDFs que no las traen."""
     M = T["marca"]
+    if marca.recuadro and (M is None or M["recuadro"] is None):
+        marca = replace(marca, recuadro=[])
     if conservar_fabrica or marca.pie or not marca.datos or M is None or M["pie_por_defecto"] != "datos":
         return marca
-    return Marca(marca.logo, marca.datos, pie_de_datos(marca.datos, M["zona_pie"]), marca.condiciones)
+    return replace(marca, pie=pie_de_datos(marca.datos, M["zona_pie"]))
 
 
 INTERLINEA_CONDICIONES = 1.4
@@ -1475,18 +1525,21 @@ def pad(r: tuple, d: float = 0.5) -> fitz.Rect:
 
 
 def stamp_bloque(page: fitz.Page, lineas: list[str], zona: tuple, tams: tuple[float, float],
-                 derecha: bool) -> None:
-    """Líneas centradas en vertical en la zona, alineadas a la izquierda o a la derecha."""
+                 derecha: bool, primera_negrita: bool = False) -> None:
+    """Líneas centradas en vertical en la zona, alineadas a la izquierda o a la derecha.
+    primera_negrita: solo la primera en negrita y el resto en normal (si no, todas en negrita)."""
     z = fitz.Rect(zona)
-    t = tam_texto(lineas, zona, tams)
+    fuentes = fuentes_recuadro(lineas) if primera_negrita else None
+    t = tam_texto(lineas, zona, tams, fuentes)
     assert t is not None  # validate_marca ya lo comprobó
     paso = t * INTERLINEA
     y = z.y0 + (z.height - paso * len(lineas)) / 2 + t
-    for linea in lineas:
+    for i, linea in enumerate(lineas):
+        nombre = FONT_REG_NAME if primera_negrita and i else FONT_NAME
         if derecha:
             stamp_right(page, linea, z.x1, y, t, 0)
         else:
-            page.insert_text((z.x0, y), linea, fontname=FONT_NAME, fontsize=t, color=(0, 0, 0))
+            page.insert_text((z.x0, y), linea, fontname=nombre, fontsize=t, color=(0, 0, 0))
         y += paso
 
 
@@ -1516,7 +1569,9 @@ def zonas_marca(marca: Marca | None, T: dict, n: int) -> list[tuple]:
 
 def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Marca | None = None,
                      conservar_fabrica: bool = False, bc: BloqueConceptos | None = None,
-                     pc: PlanCondiciones | None = None) -> bytes:
+                     pc: PlanCondiciones | None = None, recuadros: dict[int, fitz.Rect] | None = None) -> bytes:
+    """recuadros: zona del recuadro del montador por página (solo si trae texto propio para él)."""
+    recuadros = recuadros or {}
     doc = fitz.open(stream=pdf, filetype="pdf")
     labels = {"Base Imponible": "Base Imponible", "Total": "Total", "TOTAL": "TOTAL"}
 
@@ -1529,6 +1584,8 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
         n = page.number
         for z in zonas_marca(marca, T, n):
             page.add_redact_annot(fitz.Rect(z), fill=False)
+        if n in recuadros:  # su contenido (datos del montador); el borde del recuadro se conserva
+            page.add_redact_annot(recuadros[n], fill=False)
         if pc is not None and pc.pagina == n:
             page.add_redact_annot(pc.zona | (pc.borrar or pc.zona), fill=False)
         # Precios y totales: redacción sin relleno para conservar el fondo de las filas.
@@ -1628,6 +1685,9 @@ def redact_and_stamp(pdf: bytes, ex: Extraccion, calc: dict, T: dict, marca: Mar
                 stamp_bloque(page, marca.datos, M["zona_datos"], TAM_DATOS, derecha=True)
             if marca.pie:
                 stamp_bloque(page, marca.pie, M["zona_pie"], TAM_PIE, derecha=False)
+            if marca.recuadro and n in recuadros:
+                stamp_bloque(page, marca.recuadro, zona_texto_recuadro(recuadros[n], T), TAM_RECUADRO,
+                             derecha=False, primera_negrita=True)
 
     # Limpieza de todo lo que no sea contenido visible.
     doc.set_metadata({})
@@ -1678,6 +1738,26 @@ def verify_marca(doc: fitz.Document, marca: Marca, T: dict) -> list[str]:
     for i, texto in enumerate(textos):
         if any(_normal(l) not in texto for l in marca.pie):
             err.append(f"p{i + 1}: pie del montador no estampado")
+    if marca.recuadro:
+        # En cada página con recuadro, solo el texto del montador: nada del original.
+        con_recuadro = 0
+        for page in doc:
+            z = zona_recuadro(page, T)
+            if z is None:
+                continue
+            con_recuadro += 1
+            resto = _normal(page.get_text(clip=z))
+            for linea in marca.recuadro:
+                if _normal(linea) not in resto:
+                    err.append(f"p{page.number + 1}: texto del recuadro no estampado")
+                    break
+                resto = resto.replace(_normal(linea), "", 1)
+            if resto.strip():
+                err.append(f"p{page.number + 1}: quedan restos del texto original en el recuadro")
+            if any(fitz.Rect(i["bbox"]).intersects(z) for i in page.get_image_info()):
+                err.append(f"p{page.number + 1}: queda una imagen en el recuadro")
+        if not con_recuadro:
+            err.append("recuadro del montador no encontrado en el PDF generado")
     return err
 
 
@@ -1954,8 +2034,11 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
         calc = calcular(ex, pct, modo, montaje, pct_lineas, conceptos, iva_pct)
     if calc is not None and calc["base"] < 0:
         errores, calc = ["conceptos: los descuentos dejan el presupuesto en negativo"], None
+    recuadros = zonas_recuadro(pdf, T) if calc is not None and marca.recuadro else {}
+    if calc is not None and marca.recuadro and not recuadros:
+        errores, calc = ["no se encuentra el recuadro del montador para su texto"], None
     if calc is not None:
-        salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica, bc, pc)
+        salida = redact_and_stamp(pdf, ex, calc, T, marca, conservar_fabrica, bc, pc, recuadros)
         with fitz.open(stream=pdf, filetype="pdf") as orig:
             texto_original = "\n".join(p.get_text() for p in orig)
         errores, miniaturas = verify(ex, calc, salida, T, marca, conservar_fabrica, bc, pc, texto_original)

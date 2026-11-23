@@ -199,7 +199,7 @@ MARCA = {"logo": base64.b64encode(png()).decode("ascii"),
 
 
 @pytest.mark.parametrize("marca", [{"logo": "no es base64!"}, {"datos": ["x"] * 7}, {"pie": [""]},
-                                   {"otro": 1}])
+                                   {"recuadro": ["x"] * 7}, {"recuadro": [""]}, {"otro": 1}])
 def test_marca_no_valida_400(marca):
     almacen = Almacen()
     assert generar(cliente(almacen), marca=marca).status_code == 400

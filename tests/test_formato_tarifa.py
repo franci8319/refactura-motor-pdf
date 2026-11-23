@@ -348,3 +348,68 @@ def test_ultima_fila_principal_toma_el_modelo_de_una_fila_de_una_linea(plantilla
     calc = motor.calcular(ex, Decimal(30), "markup", None, {}, conceptos)
     salida = fitz.open(stream=motor.redact_and_stamp(pdf, ex, calc, T, None, False, bc, None), filetype="pdf")
     assert motor.verify_conceptos_tabla(salida, bc) == []
+
+
+# --- Recuadro con los datos del montador ("marca.recuadro") ---
+
+RECUADRO = ["Comercial: ANA", "MÓVIL: 600 000 000", "comercial@ejemplo.es"]
+
+
+def _texto_fuera(page: fitz.Page, marco: fitz.Rect, zona: fitz.Rect) -> list[str]:
+    """Palabras del recuadro original que quedan fuera de la zona que se sustituye (código de cliente…)."""
+    return [w[4] for w in page.get_text("words") if marco.contains(fitz.Rect(w[:4])) and not fitz.Rect(w[:4]).intersects(zona)]
+
+
+@casos
+def test_texto_propio_en_el_recuadro_del_montador(plantilla, sample):
+    if "recuadro" not in plantilla["marca"]:
+        pytest.skip("plantilla sin recuadro del montador")
+    T = motor.compile_template(plantilla)
+    with fitz.open(stream=sample.read_bytes(), filetype="pdf") as orig:
+        zonas = {p.number: motor.zona_recuadro(p, T) for p in orig}
+        assert all(zonas.values())
+        marcos = {n: next(fitz.Rect(d["rect"]) for d in orig[n].get_drawings() if fitz.Rect(d["rect"]).contains(z))
+                  for n, z in zonas.items()}
+        fuera = {n: _texto_fuera(orig[n], marcos[n], z) for n, z in zonas.items()}
+        dentro = {n: orig[n].get_text(clip=z).split() for n, z in zonas.items()}
+    d, salida = _generar(plantilla, sample, pct=30, marca={"recuadro": RECUADRO})
+    assert d["estado"] == "ok", d["errores"]
+    for n, z in zonas.items():
+        page = salida[n]
+        texto = page.get_text(clip=z)
+        assert all(l in texto for l in RECUADRO)
+        assert not any(w in texto.split() for w in dentro[n] if w not in " ".join(RECUADRO))
+        assert _texto_fuera(page, marcos[n], z) == fuera[n]  # el código de cliente se conserva
+        assert any(dr["rect"] == marcos[n] for dr in page.get_drawings())  # y el borde del recuadro
+    # La primera línea, en negrita; el resto, en normal.
+    spans = [s for b in salida[0].get_text("dict", clip=zonas[0])["blocks"] for l in b["lines"] for s in l["spans"]]
+    negrita = {s["text"].strip(): bool(s["flags"] & 16) or "Bold" in s["font"] for s in spans if s["text"].strip()}
+    assert negrita[RECUADRO[0]] and not negrita[RECUADRO[1]]
+
+
+@casos
+@pytest.mark.parametrize(("lineas", "error"), [
+    (["Comercial: ANA " * 5], "no cabe"),  # 75 caracteres: pasa el contrato, no cabe a 6 pt
+    (["a"] * 6 + ["b"], None),  # el contrato admite como mucho 6 líneas
+    (["Comercial: ANA ☎"], "caracteres no admitidos"),
+])
+def test_texto_del_recuadro_que_no_vale(plantilla, sample, lineas, error):
+    if "recuadro" not in plantilla["marca"]:
+        pytest.skip("plantilla sin recuadro del montador")
+    almacen = Almacen(sample.read_bytes())
+    r = generar(cliente(almacen), plantilla=plantilla, marca={"recuadro": lineas})
+    if error is None:
+        assert r.status_code == 400
+        return
+    d = r.json()
+    assert d["estado"] == "needs_review" and any(e.startswith("marca:") and error in e for e in d["errores"])
+    assert not almacen.subidas
+
+
+@casos
+def test_recuadro_se_ignora_en_plantillas_que_no_lo_definen(plantilla, sample):
+    p = copy.deepcopy(plantilla)
+    p["marca"].pop("recuadro", None)
+    d, salida = _generar(p, sample, pct=30, marca={"recuadro": RECUADRO})
+    assert d["estado"] == "ok", d["errores"]
+    assert not any(l in salida[0].get_text() for l in RECUADRO)

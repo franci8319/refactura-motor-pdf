@@ -74,6 +74,8 @@ def main() -> int:
     ap.add_argument("--logo", type=Path, help="logo del montador (PNG o JPEG)")
     ap.add_argument("--dato", action="append", default=[], help="línea de datos del montador (repetible)")
     ap.add_argument("--pie", action="append", default=[], help="línea del pie del montador (repetible)")
+    ap.add_argument("--recuadro", action="append", default=[],
+                    help="línea del recuadro con los datos del montador, la 1.ª en negrita (repetible)")
     ap.add_argument("--iva", type=Decimal, help="% de IVA del presupuesto del cliente (por defecto, el del PDF)")
     ap.add_argument("--condiciones", type=Path, help="archivo de texto con las condiciones del montador")
     ap.add_argument("--concepto", action="append", default=[], metavar="TEXTO=IMPORTE",
@@ -90,7 +92,7 @@ def main() -> int:
         ap.error("el montaje no puede ser negativo")
     pdfs = args.pdfs or sorted((ROOT / "samples").glob("*.pdf"))
     marca = Marca(args.logo.read_bytes() if args.logo else None, args.dato, args.pie,
-                  args.condiciones.read_text(encoding="utf-8") if args.condiciones else None)
+                  args.condiciones.read_text(encoding="utf-8") if args.condiciones else None, args.recuadro)
     conceptos = []
     for c in args.concepto:
         texto, _, importe = c.rpartition("=")
