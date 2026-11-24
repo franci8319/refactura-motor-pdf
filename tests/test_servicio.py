@@ -26,7 +26,16 @@ REALES = sorted((ROOT / "templates").glob("*.json"))
 PLANTILLA = json.loads((REALES[-1] if REALES else Path(__file__).with_name("plantilla_ejemplo.json"))
                        .read_text(encoding="utf-8"))
 ID_PLANTILLA = f"{PLANTILLA['id']}-v{PLANTILLA['version']}"
-SAMPLES = sorted((ROOT / "samples").glob("*.pdf")) if REALES else []
+import motor  # noqa: E402
+
+
+def _de_esta_plantilla(pdf: Path) -> bool:
+    with fitz.open(pdf) as d:
+        return not motor.check_huella(d, motor.compile_template(PLANTILLA))
+
+
+# Los PDFs de samples/ que reconoce esa plantilla (en la raíz puede haber de otros formatos).
+SAMPLES = [p for p in sorted((ROOT / "samples").glob("*.pdf")) if _de_esta_plantilla(p)] if REALES else []
 # ids sin nombres de cliente (los nombres de archivo los llevan)
 IDS = [f"pdf{i}" for i in range(1, len(SAMPLES) + 1)]
 con_samples = pytest.mark.skipif(not SAMPLES, reason="sin PDFs en samples/ o sin plantilla real en templates/")

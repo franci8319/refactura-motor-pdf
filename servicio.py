@@ -6,7 +6,8 @@ el worker lo descarga de una URL firmada del bucket temporal y sube el generado 
   GET  /salud         → {"ok": true}
   POST /v1/analizar   {pdf_url, plantilla}
                       → huella, extracción y validación (lo que el montador revisa); cada línea
-                        lleva "dibujo_png" (PNG en base64 del dibujo de la ventana, o null)
+                        lleva "dibujo_png" (PNG en base64 del dibujo de la ventana, o null); "recuadro" =
+                        líneas del recuadro del destinatario tal como vienen (o null)
   POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?, conservar_fabrica?,
                         conceptos?, iva_pct?}
                       → redacción, estampado, verificación de salida y subida del PDF (PUT a salida_url)
@@ -105,7 +106,8 @@ class PeticionMarca(BaseModel):
     datos: list[Linea] = Field(default_factory=list, max_length=6)
     pie: list[Linea] = Field(default_factory=list, max_length=3)
     condiciones: str | None = Field(default=None, max_length=4000)  # sustituye las condiciones de la fábrica
-    # Sustituye el texto del recuadro con los datos del montador (solo en plantillas que lo definen).
+    # Sustituye el texto del recuadro del destinatario (solo en plantillas que lo definen; ver "recuadro" en
+    # la respuesta de /v1/analizar: el texto que trae el PDF).
     recuadro: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(default_factory=list, max_length=6)
 
     def a_motor(self) -> motor.Marca:

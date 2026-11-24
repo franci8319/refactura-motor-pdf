@@ -187,10 +187,11 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
                 "pie_por_defecto": pie_defecto,
                 # false: la cabecera de fábrica ocupa el hueco del logo; conservándola no cabe el del montador.
                 "logo_con_fabrica": bool(marca.get("logo_con_fabrica", True)),
-                # Opcional: recuadro con los datos del propio montador (no del cliente final), que puede
-                # sustituir por su texto. Zona relativa a un ancla de texto, en cada página que la tenga.
+                # Opcional: recuadro del destinatario (el cliente que pone el montador: un cliente final o él
+                # mismo), que el montador puede cambiar en cada presupuesto. Zona relativa a un ancla: regex que
+                # se busca en cada línea de texto (distingue mayúsculas), en cada página que la tenga.
                 "recuadro": None if "recuadro" not in marca else {
-                    "ancla": marca["recuadro"]["ancla"],
+                    "ancla": re.compile(marca["recuadro"]["ancla"]),
                     "zona": tuple(marca["recuadro"]["zona"]),  # dx0, dy0, dx1, dy1 desde la esquina del ancla
                     "sangria": float(marca["recuadro"].get("sangria", 0)),  # pt desde el borde izquierdo
                 },
@@ -748,16 +749,45 @@ def zona_texto_recuadro(zona: fitz.Rect, T: dict) -> tuple:
     return (zona.x0 + T["marca"]["recuadro"]["sangria"], zona.y0, zona.x1, zona.y1)
 
 
+def _lineas_texto(page: fitz.Page) -> list[tuple[fitz.Rect, str]]:
+    return [(fitz.Rect(l["bbox"]), "".join(s["text"] for s in l["spans"]).strip())
+            for b in page.get_text("dict")["blocks"] for l in b.get("lines", [])]
+
+
 def zona_recuadro(page: fitz.Page, T: dict) -> fitz.Rect | None:
-    """Recuadro del montador en esta página (relativo a su ancla), o None si la página no lo tiene."""
+    """Recuadro del destinatario en esta página (relativo a su ancla), o None si la página no lo tiene.
+    El ancla es una regex sobre el texto de cada línea: así "PRESUPUESTO 797/2" (p1, con recuadro) no se
+    confunde con "Presupuesto:797 /2" (cabecera de las demás páginas, sin recuadro)."""
     R = (T["marca"] or {}).get("recuadro")
     if R is None:
         return None
-    hits = page.search_for(R["ancla"])
-    if not hits:
+    a = next((r for r, t in _lineas_texto(page) if R["ancla"].search(t)), None)
+    if a is None:
         return None
-    a, (z0, z1, z2, z3) = hits[0], R["zona"]
+    z0, z1, z2, z3 = R["zona"]
     return fitz.Rect(a.x0 + z0, a.y0 + z1, a.x0 + z2, a.y0 + z3) & page.rect
+
+
+def texto_recuadro(pdf: bytes, T: dict) -> list[str] | None:
+    """Líneas del recuadro del destinatario tal como vienen (la primera página que lo tenga), para que el
+    montador las revise y cambie. Los trozos de una misma línea (código de cliente y nombre) van juntos."""
+    with fitz.open(stream=pdf, filetype="pdf") as doc:
+        for page in doc:
+            z = zona_recuadro(page, T)
+            if z is None:
+                continue
+            spans = [s for b in page.get_text("dict", clip=z)["blocks"] for l in b.get("lines", [])
+                     for s in l["spans"] if s["text"].strip() and z.contains(fitz.Point(
+                         (s["bbox"][0] + s["bbox"][2]) / 2, (s["bbox"][1] + s["bbox"][3]) / 2))]
+            filas: list[list[dict]] = []
+            for s in sorted(spans, key=lambda s: (s["origin"][1], s["origin"][0])):
+                if filas and abs(filas[-1][0]["origin"][1] - s["origin"][1]) <= 2:
+                    filas[-1].append(s)
+                else:
+                    filas.append([s])
+            return [" ".join(" ".join(s["text"].split()) for s in sorted(f, key=lambda s: s["origin"][0]))
+                    for f in filas]
+    return None
 
 
 def zonas_recuadro(pdf: bytes, T: dict) -> dict[int, fitz.Rect]:
@@ -2001,7 +2031,9 @@ def analizar(pdf: bytes, T: dict) -> Resultado:
              "n_dibujos": ex.n_dibujos, "lineas": _lineas_publicas(ex, None),
              "totales_fabrica": _totales_fabrica(ex) if not errores else None,
              # La plantilla sabe dónde añadir conceptos del montador (instalación, portes…).
-             "admite_conceptos": T["conceptos"] is not None}
+             "admite_conceptos": T["conceptos"] is not None,
+             # Texto del recuadro del destinatario (None si la plantilla no lo define o el PDF no lo tiene).
+             "recuadro": None if errores else texto_recuadro(pdf, T)}
     return Resultado(datos, dibujos=[] if errores else recortar_dibujos(pdf, ex))
 
 

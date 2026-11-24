@@ -90,3 +90,52 @@ def test_pie_del_montador_centrado_y_en_letra_normal(pdf):
             assert zona.contains(r)
             centrado = abs((r.x0 + r.x1) / 2 - page.rect.width / 2) <= 1
             assert centrado or r.x0 <= zona.x0 + 1 or r.x1 >= zona.x1 - 1, f"p{page.number + 1}: pie sin centrar"
+
+
+NUEVO_RECUADRO = ["Comercial: PRUEBA", "MÓVIL: 600 000 000", "prueba@ejemplo.es"]
+
+
+@pytest.mark.parametrize("pdf", PDFS, ids=IDS)
+def test_recuadro_del_destinatario_se_lee_y_se_sustituye(pdf):
+    """Donde la plantilla define el recuadro del destinatario: analizar devuelve su texto y, con un texto nuevo,
+    en cada página que lo tiene solo queda ese texto; en las demás páginas no cambia nada."""
+    T = reconocen(pdf)[0]
+    if (T["marca"] or {}).get("recuadro") is None:
+        pytest.skip("plantilla sin recuadro del destinatario")
+    b = pdf.read_bytes()
+    a = motor.analizar(b, T)
+    assert a.ok and a.datos["recuadro"], "el recuadro no se lee"
+    g = motor.generar(b, T, Decimal(30), marca=motor.Marca(recuadro=NUEVO_RECUADRO))
+    assert g.ok, g.datos["errores"]
+    with fitz.open(stream=b, filetype="pdf") as orig, fitz.open(stream=g.pdf, filetype="pdf") as out:
+        for po, ps in zip(orig, out):
+            z = motor.zona_recuadro(po, T)
+            if z is None:  # sin recuadro: ni rastro del texto nuevo
+                assert motor.zona_recuadro(ps, T) is None
+                assert not any(l in ps.get_text() for l in NUEVO_RECUADRO)
+                continue
+            assert ps.get_text(clip=z).split() == " ".join(NUEVO_RECUADRO).split()
+            assert not any(l in ps.get_text(clip=z) for l in a.datos["recuadro"])
+
+
+@pytest.mark.parametrize("pdf", PDFS, ids=IDS)
+def test_sin_texto_nuevo_el_recuadro_queda_como_venia(pdf):
+    T = reconocen(pdf)[0]
+    if (T["marca"] or {}).get("recuadro") is None:
+        pytest.skip("plantilla sin recuadro del destinatario")
+    b = pdf.read_bytes()
+    g = motor.generar(b, T, Decimal(30), marca=motor.Marca(pie=MARCA["pie"]))
+    assert g.ok, g.datos["errores"]
+    assert motor.texto_recuadro(g.pdf, T) == motor.texto_recuadro(b, T)
+
+
+def test_el_ancla_del_recuadro_distingue_mayusculas():
+    """La cabecera "Presupuesto:797 /2" de las páginas 2+ no es el ancla "PRESUPUESTO 797/2" del recuadro."""
+    T = motor.compile_template({**PLANTILLAS[0], "marca": {**(PLANTILLAS[0].get("marca") or {}),
+                                "zona_logo": {"pagina": 1, "rect": [0, 0, 1, 1]}, "zona_datos": {"pagina": 1, "rect": [0, 0, 1, 1]},
+                                "zona_pie": {"rect": [0, 0, 1, 1]},
+                                "recuadro": {"ancla": r"^PRESUPUESTO \d", "zona": [0, 0, 100, 20]}}})
+    doc = fitz.open()
+    for texto in ("PRESUPUESTO 797/2", "Presupuesto:797 /2"):
+        doc.new_page().insert_text((50, 100), texto)
+    assert motor.zona_recuadro(doc[0], T) is not None and motor.zona_recuadro(doc[1], T) is None
