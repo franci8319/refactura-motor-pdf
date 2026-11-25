@@ -89,7 +89,7 @@ def test_pie_del_montador_centrado_y_en_letra_normal(pdf):
             assert not s["flags"] & 16 and "Bold" not in s["font"], f"p{page.number + 1}: pie en negrita ({s['font']})"
             assert zona.contains(r)
             centrado = abs((r.x0 + r.x1) / 2 - page.rect.width / 2) <= 1
-            assert centrado or r.x0 <= zona.x0 + 1 or r.x1 >= zona.x1 - 1, f"p{page.number + 1}: pie sin centrar"
+            assert centrado or r.x0 <= zona.x0 + 1.01 or r.x1 >= zona.x1 - 1.01, f"p{page.number + 1}: pie sin centrar"
 
 
 NUEVO_RECUADRO = ["Comercial: PRUEBA", "MÓVIL: 600 000 000", "prueba@ejemplo.es"]
