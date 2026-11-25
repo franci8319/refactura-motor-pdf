@@ -9,7 +9,7 @@ el worker lo descarga de una URL firmada del bucket temporal y sube el generado 
                         lleva "dibujo_png" (PNG en base64 del dibujo de la ventana, o null); "recuadro" =
                         líneas del recuadro del destinatario tal como vienen (o null)
   POST /v1/generar    {pdf_url, salida_url, plantilla, pct, modo?, montaje?, pct_lineas?, marca?, conservar_fabrica?,
-                        conceptos?, iva_pct?}
+                        conceptos?, iva_pct?, precios_lineas?}
                       → redacción, estampado, verificación de salida y subida del PDF (PUT a salida_url)
                         marca = {logo?: PNG/JPEG en base64, datos?: [líneas], pie?: [líneas], condiciones?: texto,
                                  recuadro?: [líneas] (la 1.ª en negrita)};
@@ -86,6 +86,7 @@ class ErrorPeticion(Exception):
 
 # % de beneficio: global o por línea. El tope de margen (<100) depende del modo, va en el modelo.
 Pct = Annotated[Decimal, Field(ge=0, le=1000, decimal_places=2)]
+Importe = Annotated[Decimal, Field(ge=0, le=1_000_000, decimal_places=2)]
 MAX_CUERPO = 1024 * 1024  # JSON con plantilla; el PDF va por URL
 
 
@@ -148,6 +149,7 @@ class PeticionGenerar(PeticionAnalizar):
     conservar_fabrica: bool = False  # deja el logo y el nombre de la fábrica; los precios se eliminan siempre
     conceptos: list[PeticionConcepto] = Field(default_factory=list, max_length=20)  # la plantilla fija el máximo
     iva_pct: Decimal | None = Field(default=None, ge=0, le=100, decimal_places=2)  # sin él, el del PDF
+    precios_lineas: dict[int, Importe] = Field(default_factory=dict)  # precio del montador en líneas de portes
 
     @model_validator(mode="after")
     def _pcts(self) -> PeticionGenerar:
@@ -196,9 +198,9 @@ def _plantilla(raw: dict) -> dict:
         raise ErrorPeticion(400, str(e)) from e
 
 
-def _con_motor(fn, *args):
+def _con_motor(fn, *args, **kwargs):
     with _MOTOR:
-        return fn(*args)
+        return fn(*args, **kwargs)
 
 
 def _respuesta(datos: dict, status: int = 200) -> JSONResponse:
@@ -245,7 +247,7 @@ def crear_app(cfg: Config | None = None, transporte: httpx.BaseTransport | None 
         pdf = _descargar(cliente, p.pdf_url, cfg)
         conceptos = [motor.Concepto(c.texto.strip(), c.importe, c.uds or 1, c.precio) for c in p.conceptos]
         r = _con_motor(motor.generar, pdf, T, p.pct, p.modo, p.montaje, p.pct_lineas, marca,
-                       p.conservar_fabrica, conceptos, p.iva_pct)
+                       p.conservar_fabrica, conceptos, p.iva_pct, precios_lineas=p.precios_lineas)
         if not r.ok:
             return {**r.datos, "entregado": False}
         _subir(cliente, p.salida_url, r.pdf)

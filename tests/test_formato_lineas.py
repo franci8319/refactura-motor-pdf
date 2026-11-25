@@ -158,6 +158,65 @@ def test_la_linea_de_los_totales_lleva_el_pct(plantilla, sample):
     assert motor.parse_eur(motor.get_total(ex_s, "Subtotal").valor) == base - Decimal("13.00")
 
 
+def _portes(plantilla: dict) -> list[str]:
+    """Líneas de los totales que son portes (el montador puede poner su precio)."""
+    return [k for k, v in plantilla["totales_lineas"]["lineas"].items() if isinstance(v, dict) and v.get("tipo") == "portes"]
+
+
+@con_pdf
+@casos
+@pytest.mark.parametrize("coste", [Decimal(0), Decimal(10)])
+def test_portes_con_el_precio_del_montador_sin_pct(plantilla, sample, coste):
+    if not _portes(plantilla):
+        pytest.skip("la plantilla no tiene portes")
+    pdf = sample.read_bytes()
+    T, ex = _analisis(plantilla, pdf)
+    if coste:
+        plantilla = _con_fuente_de_prueba(plantilla)
+        pdf = _con_linea_de_totales(pdf, T, ex, coste)
+        T, ex = _analisis(plantilla, pdf)
+    i = next(i for i, ln in enumerate(ex.lineas) if ln.tipo == "portes")
+    r = motor.generar(pdf, T, Decimal(30), precios_lineas={i: Decimal("25.50")})
+    assert r.ok, r.datos["errores"]
+    assert r.datos["lineas"][i]["pct"] is None and r.datos["lineas"][i]["total"] == Decimal("25.50")
+    ex_s = motor.extract(_abrir(r.pdf), T)
+    assert motor.parse_eur(ex_s.lineas[i].total) == Decimal("25.50")
+    assert ex_s.lineas[i].formato.format(valor="25,50") in _abrir(r.pdf)[ex_s.lineas[i].pagina].get_text()
+    filas = sum(c["total"] for ln, c in zip(ex.lineas, r.datos["lineas"]) if not ln.en_totales)
+    assert r.datos["totales"]["base"] == filas + Decimal("25.50")
+    # Sin precio, los portes llevan el % como las demás líneas.
+    r = motor.generar(pdf, T, Decimal(30))
+    assert r.ok and r.datos["lineas"][i]["pct"] == 30 and r.datos["lineas"][i]["total"] == coste * Decimal("1.3")
+
+
+@con_pdf
+@casos
+def test_precio_de_portes_por_http(plantilla, sample):
+    from test_servicio import Almacen, cliente, generar
+    if not _portes(plantilla):
+        pytest.skip("la plantilla no tiene portes")
+    _, ex = _analisis(plantilla, sample.read_bytes())
+    i = next(i for i, ln in enumerate(ex.lineas) if ln.tipo == "portes")
+    almacen = Almacen(sample.read_bytes())
+    d = generar(cliente(almacen), plantilla=plantilla, precios_lineas={str(i): "12.30"}).json()
+    assert d["estado"] == "ok", d["errores"]
+    assert d["lineas"][i]["pct"] is None and d["lineas"][i]["total"] == "12.30" and almacen.subidas
+    r = generar(cliente(Almacen(sample.read_bytes())), plantilla=plantilla, precios_lineas={str(i): "-1"})
+    assert r.status_code == 400  # parámetros no válidos
+
+
+@con_pdf
+@casos
+def test_precio_propio_solo_en_portes(plantilla, sample):
+    pdf = sample.read_bytes()
+    T, ex = _analisis(plantilla, pdf)
+    i = next(i for i, ln in enumerate(ex.lineas) if ln.tipo != "portes")
+    r = motor.generar(pdf, T, Decimal(30), precios_lineas={i: Decimal(10)})
+    assert not r.ok and any("precio propio" in e for e in r.datos["errores"])
+    r = motor.generar(pdf, T, Decimal(30), precios_lineas={99: Decimal(10)})
+    assert not r.ok and any("no existe" in e for e in r.datos["errores"])
+
+
 @con_pdf
 @casos
 def test_columnas_fuera_vacias_salvo_conservando_la_fabrica(plantilla, sample):

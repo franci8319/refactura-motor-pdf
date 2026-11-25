@@ -125,11 +125,14 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
                 },
                 # Totales en líneas sueltas ("Sub-total: 1.234,56€"): regex por etiqueta con los grupos "valor" y,
                 # en el IVA, "pct"; se reescribe la línea entera cambiando solo esos números. "lineas": filas de los
-                # totales que son una línea más del presupuesto (el envío): llevan el % como las de la tabla.
+                # totales que son una línea más del presupuesto (el envío): llevan el % como las de la tabla. Cada
+                # una es una regex o {"regex", "tipo"}; tipo "portes": el montador puede poner su precio (sin %).
                 "totales_lineas": None if tl is None else {
                     "izquierda": tl.get("alinear", "derecha") == "izquierda",
                     "etiquetas": {k: re.compile(v) for k, v in tl["etiquetas"].items()},
-                    "lineas": {k: re.compile(v) for k, v in tl.get("lineas", {}).items()},
+                    "lineas": {k: re.compile(v if isinstance(v, str) else v["regex"])
+                               for k, v in tl.get("lineas", {}).items()},
+                    "tipos": {k: (t.get("tipo", "extra") if isinstance(t, dict) else None) for k, t in tl.get("lineas", {}).items()},
                 },
                 "pct": re.compile(raw.get("pct", r"^\s*(\d{1,2}(?:,\d{1,2})?)\s*$")),
             }
@@ -148,6 +151,8 @@ def compile_template(raw: dict, nombre: str = "plantilla") -> dict:
                 if any("valor" not in rx.groupindex for rx in [*et.values(), *T["totales_lineas"]["lineas"].values()]) \
                         or "pct" not in et.get("IVA", re.compile("(?P<pct>)")).groupindex:
                     raise ValueError("totales_lineas: cada regex necesita el grupo «valor» (y el IVA, «pct»)")
+                if set(T["totales_lineas"]["tipos"].values()) - {None, "extra", "portes"}:
+                    raise ValueError("totales_lineas.lineas: tipo extra o portes")
         if con is not None and con.get("totales_fijos") and con.get("en_tabla"):
             raise ValueError("conceptos: totales_fijos y en_tabla no van juntos")
         if con is not None and con.get("filas", "lineas") not in ("lineas", "bandas", "rayas"):
@@ -552,7 +557,7 @@ def extract_tabla(doc: fitz.Document, T: dict) -> Extraccion:
                                                 izquierda=TL["izquierda"]))
                 for label, rx in TL["lineas"].items():
                     if (m := rx.match(texto)) is not None:
-                        ex.lineas.append(Linea(page.number, C["tipo"], label, 1, m["valor"], m["valor"], s.bbox,
+                        ex.lineas.append(Linea(page.number, TL["tipos"][label] or C["tipo"], label, 1, m["valor"], m["valor"], s.bbox,
                                                s.bbox, s.origin, s.origin, s.size, s.color,
                                                negrita_importe=s.bold, negrita_total=s.bold, en_totales=True,
                                                formato=_formato(texto, m), izquierda=TL["izquierda"]))
@@ -881,7 +886,7 @@ def validate_subtotales(ex: Extraccion, totales_lineas: list[Decimal]) -> list[s
 
 
 def validate_params(ex: Extraccion, montaje: Decimal | None, pct_lineas: dict[int, Decimal],
-                    T: dict | None = None) -> list[str]:
+                    T: dict | None = None, precios_lineas: dict[int, Decimal] | None = None) -> list[str]:
     """Parámetros que solo se pueden comprobar contra las líneas extraídas."""
     err = []
     if montaje is not None and not tiene_montaje(ex) and (T is None or T["conceptos"] is None):
@@ -891,6 +896,11 @@ def validate_params(ex: Extraccion, montaje: Decimal | None, pct_lineas: dict[in
             err.append(f"pct_lineas: la línea {i} no existe")
         elif ex.lineas[i].tipo in ("montaje", "descuento"):
             err.append(f"pct_lineas: la línea {i} es {ex.lineas[i].tipo}, que nunca lleva %")
+    for i in sorted(precios_lineas or {}):
+        if not 0 <= i < len(ex.lineas):
+            err.append(f"precios_lineas: la línea {i} no existe")
+        elif ex.lineas[i].tipo != "portes":
+            err.append(f"precios_lineas: la línea {i} es {ex.lineas[i].tipo}, que no admite precio propio")
     return err
 
 
@@ -1816,10 +1826,12 @@ def fmt_pct(v: Decimal, como: str | None = None) -> str:
 
 def calcular(ex: Extraccion, pct: Decimal, modo: str, montaje: Decimal | None,
              pct_lineas: dict[int, Decimal], conceptos: list[Concepto] | None = None,
-             iva_pct: Decimal | None = None) -> dict:
+             iva_pct: Decimal | None = None, precios_lineas: dict[int, Decimal] | None = None) -> dict:
     """Ventanas: coste de fábrica + % (global o de la línea). Montaje: precio del montador, sin %.
+    Portes: coste + %, o el precio que ponga el montador (precios_lineas), sin %.
 
     Conceptos añadidos por el montador: precio final, sin %, suman a la base."""
+    precios_lineas = precios_lineas or {}
     lineas = []
     for i, ln in enumerate(ex.lineas):
         if ln.tipo == "descuento":
@@ -1827,6 +1839,8 @@ def calcular(ex: Extraccion, pct: Decimal, modo: str, montaje: Decimal | None,
         elif ln.tipo == "montaje":
             p = None
             unit = montaje if montaje is not None else parse_eur(ln.importe)
+        elif ln.tipo == "portes" and i in precios_lineas:
+            p, unit = None, precios_lineas[i]
         else:
             p = pct_lineas.get(i, pct)
             unit = precio_cliente(parse_eur(ln.importe), p, modo)
@@ -2402,15 +2416,18 @@ def analizar(pdf: bytes, T: dict) -> Resultado:
 def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: Decimal | None = None,
             pct_lineas: dict[int, Decimal] | None = None, marca: Marca | None = None,
             conservar_fabrica: bool = False, conceptos: list[Concepto] | None = None,
-            iva_pct: Decimal | None = None, diagnostico: bool = False) -> Resultado:
+            iva_pct: Decimal | None = None, diagnostico: bool = False,
+            precios_lineas: dict[int, Decimal] | None = None) -> Resultado:
     """Analiza de nuevo (sin estado), calcula, redacta, estampa y verifica la salida.
 
     diagnostico: solo para herramientas internas; con needs_review devuelve igualmente el PDF generado
     (Resultado.ok sigue en False: el servicio no lo entrega nunca).
 
     conservar_fabrica: deja el logo y el nombre de la fábrica (los precios se eliminan siempre).
-    conceptos: líneas añadidas por el montador (sin %), en un bloque encima de los totales."""
+    conceptos: líneas añadidas por el montador (sin %), en un bloque encima de los totales.
+    precios_lineas: precio del montador para líneas de portes (sin %), por índice de línea."""
     pct_lineas = pct_lineas or {}
+    precios_lineas = precios_lineas or {}
     conceptos = list(conceptos or [])
     T = plantilla_efectiva(T, conservar_fabrica)
     marca = marca_efectiva(marca or Marca(), T, conservar_fabrica)
@@ -2420,18 +2437,19 @@ def generar(pdf: bytes, T: dict, pct: Decimal, modo: str = "markup", montaje: De
         # Compatibilidad: montaje sin línea en el PDF = concepto "Instalación".
         conceptos, montaje = [Concepto("Instalación", montaje), *conceptos], None
     if not errores:
-        errores = validate_params(ex, montaje, pct_lineas, T) + validate_marca(marca, T, conservar_fabrica)
+        errores = validate_params(ex, montaje, pct_lineas, T, precios_lineas) + validate_marca(marca, T, conservar_fabrica)
     if not errores:
         bc, errores = plan_conceptos(pdf, ex, T, conceptos)
         pc, err_cond = plan_condiciones(pdf, T, marca, conservar_fabrica, bc)
         errores += err_cond
     datos = {"plantilla": T["id"], "pct": pct, "modo": modo, "montaje": montaje,
              "pct_lineas": {str(k): v for k, v in sorted(pct_lineas.items())},
+             "precios_lineas": {str(k): v for k, v in sorted(precios_lineas.items())},
              "marca": not marca.vacia, "conservar_fabrica": conservar_fabrica, "n_dibujos": ex.n_dibujos}
     calc = salida = None
     miniaturas: list[bytes] = []
     if not errores:
-        calc = calcular(ex, pct, modo, montaje, pct_lineas, conceptos, iva_pct)
+        calc = calcular(ex, pct, modo, montaje, pct_lineas, conceptos, iva_pct, precios_lineas)
     if calc is not None and calc["base"] < 0:
         errores, calc = ["conceptos: los descuentos dejan el presupuesto en negativo"], None
     recuadros = zonas_recuadro(pdf, T) if calc is not None and marca.recuadro else {}
